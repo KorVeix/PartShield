@@ -329,6 +329,17 @@ fn raw_image_of_hibernated_ntfs_is_never_valid() {
     fs::write(origin.mnt.join("hiberfil.sys"), hiber).unwrap();
     origin.umount();
 
+    // La sonda sola, sobre el origen en lectura-escritura: lo detecta y no
+    // cambia ni un byte.
+    let before = sh("sha256sum", &[&origin.dev]);
+    let state = raw::ntfs_state(&mut Session::new(false), Path::new(&origin.dev));
+    assert!(matches!(state, raw::NtfsState::NotClean(_)), "{state:?}");
+    assert_eq!(
+        sh("sha256sum", &[&origin.dev]),
+        before,
+        "la sonda tocó el origen"
+    );
+
     let dest = tmp.path().join("copias");
     let (report, _) = backup_raw(
         &mut Session::new(false),
@@ -342,6 +353,11 @@ fn raw_image_of_hibernated_ntfs_is_never_valid() {
         },
     )
     .unwrap();
+    assert_eq!(
+        sh("sha256sum", &[&origin.dev]),
+        before,
+        "la copia tocó el origen"
+    );
     let v = report.verification.as_ref().unwrap();
     assert_eq!(report.verdict(), Verdict::Reduced, "{:#?}", v.steps);
     let st = v.steps.iter().find(|s| s.name == "estructura").unwrap();
@@ -428,4 +444,46 @@ fn raw_image_of_whole_disk_checks_each_partition() {
     assert!(st.detail.contains("partición 1"), "{}", st.detail);
     assert!(st.detail.contains("partición 3"), "{}", st.detail);
     assert!(!st.detail.contains("partición 2"), "{}", st.detail);
+}
+
+/// Un NTFS limpio se reconoce como tal sin tocarlo, y «no se puede saber»
+/// no es «limpio»: sin poder sondear, el estado es desconocido.
+#[test]
+fn ntfs_probe_is_read_only_and_unknown_is_not_clean() {
+    if std::env::var_os("PARTSHIELD_E2E").is_none() {
+        eprintln!("omitido: define PARTSHIELD_E2E=1 (necesita root y loop devices)");
+        return;
+    }
+    let have = |p: &str| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {p}"))
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !have("mkfs.ntfs") || !have("ntfs-3g.probe") {
+        eprintln!("omitido: falta ntfs-3g");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = Loop::new(tmp.path(), "origen", 200 << 20);
+    sh("mkfs.ntfs", &["-Q", "-q", "-F", &origin.dev]);
+    let before = sh("sha256sum", &[&origin.dev]);
+    let state = raw::ntfs_state(&mut Session::new(false), Path::new(&origin.dev));
+    assert_eq!(state, raw::NtfsState::Clean);
+    assert_eq!(
+        sh("sha256sum", &[&origin.dev]),
+        before,
+        "la sonda tocó el origen"
+    );
+
+    // Algo que no es NTFS: la sonda no devuelve 0 y el estado es desconocido.
+    let other = Loop::new(tmp.path(), "otro", 64 << 20);
+    sh("mkfs.ext4", &["-q", &other.dev]);
+    let state = raw::ntfs_state(&mut Session::new(false), Path::new(&other.dev));
+    assert!(matches!(state, raw::NtfsState::Unknown(_)), "{state:?}");
+
+    // Un dispositivo que no existe: tampoco es «limpio».
+    let state = raw::ntfs_state(&mut Session::new(false), &tmp.path().join("no-existe.img"));
+    assert!(matches!(state, raw::NtfsState::Unknown(_)), "{state:?}");
 }
