@@ -28,6 +28,34 @@
 
 ---
 
+## Estado: 0.1 alfa
+
+> **Alfa.** No uses todavía PartShield como única copia. Antes de copiar una
+> partición NTFS, apaga Windows del todo (`shutdown /s /t 0`): la hibernación
+> y el inicio rápido dejan el NTFS sin cerrar, y PartShield no dará esa copia
+> por comprobada.
+
+**Qué hace hoy**
+
+- Copia un disco entero o las particiones que elijas desde el USB: Btrfs con
+  `btrfs send`, el resto sector a sector, y la tabla de particiones.
+- Comprueba cada copia restaurándola en un espacio temporal: estructura,
+  montaje en solo lectura y comparación con el original. Una imagen de disco
+  entero se comprueba partición a partición.
+- Avisa de un NTFS sin cerrar y de BitLocker antes de copiar, y nunca da esas
+  copias por comprobadas.
+- Restaura desde la línea de órdenes (`partshield restore`, `restore-layout`).
+
+**Qué no hace todavía**
+
+- **Restaurar desde la interfaz.** Solo se restaura por línea de órdenes.
+- **Imágenes de bloques usados.** La copia sector a sector copia también el
+  espacio libre: un NTFS medio vacío tarda lo mismo que uno lleno.
+- **Desbloquear LUKS.** Una partición cifrada se copia tal cual, cifrada, y
+  no se puede comprobar por dentro.
+
+Está previsto para la 0.2: mira la [hoja de ruta](ROADMAP.md).
+
 ## Por qué
 
 Una copia no está hecha hasta que se ha restaurado.

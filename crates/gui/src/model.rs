@@ -553,7 +553,8 @@ pub fn measure_free(dest: &Destination) -> Option<u64> {
     free
 }
 
-/// Aviso de una partición antes de copiarla: NTFS sin cerrar o BitLocker.
+/// Aviso de una partición antes de copiarla: BitLocker, NTFS sin cerrar o
+/// NTFS que no se pudo comprobar. El origen solo se lee.
 pub fn volume_warning(v: &Volume) -> Option<String> {
     if v.is_bitlocker() {
         return Some(
@@ -563,8 +564,11 @@ pub fn volume_warning(v: &Volume) -> Option<String> {
         );
     }
     if v.fstype.as_deref() == Some("ntfs") {
-        let mut s = Session::new(false);
-        return partshield_core::raw::ntfs_not_clean(&mut s, &v.path.display().to_string());
+        use partshield_core::raw::{ntfs_state, NtfsState};
+        return match ntfs_state(&mut Session::new(false), &v.path) {
+            NtfsState::Clean => None,
+            NtfsState::NotClean(why) | NtfsState::Unknown(why) => Some(why),
+        };
     }
     None
 }
