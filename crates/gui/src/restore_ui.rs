@@ -27,8 +27,14 @@ fn verdict_look(v: SetVerdict) -> (&'static str, &'static str, &'static str) {
 
 /// «27 nov 2026, 22:15» a partir de la fecha RFC 3339 del conjunto.
 fn when(created: &str) -> String {
+    const SHOWN: &str = "%d/%m/%Y %H:%M";
     chrono::DateTime::parse_from_rfc3339(created)
-        .map(|d| d.format("%d/%m/%Y %H:%M").to_string())
+        .map(|d| d.format(SHOWN).to_string())
+        .or_else(|_| {
+            // Las copias sin conjunto solo guardan fecha y hora locales.
+            chrono::NaiveDateTime::parse_from_str(created, "%Y-%m-%dT%H:%M:%S")
+                .map(|d| d.format(SHOWN).to_string())
+        })
         .unwrap_or_else(|_| created.to_string())
 }
 
@@ -109,7 +115,7 @@ fn sets_view(
             disk_name(&f.set),
             if n == 1 { "partición" } else { "particiones" }
         );
-        let blocked = f.set.not_restorable();
+        let blocked = f.not_restorable();
         if let Some(why) = &blocked {
             sub.push_str(&format!(" · No se puede restaurar entera: {why}"));
         }
@@ -180,7 +186,7 @@ fn target_page(
         "2 · ¿En qué disco?",
         Some(
             "Se borra el disco entero y se deja como estaba al hacer la copia. Solo salen \
-             discos al menos igual de grandes que el original; nunca el que guarda la copia.",
+             discos donde cabe; nunca el que guarda la copia ni el USB de PartShield.",
         ),
     );
     let anchor = gtk::CheckButton::new();
@@ -216,7 +222,7 @@ fn target_page(
             "No hay ningún disco donde quepa",
             &format!(
                 "Hace falta un disco de al menos {} que no sea el de la copia.",
-                human_size(set.disk.size)
+                human_size(found.min_size)
             ),
         );
         row.add_prefix(&gtk::Image::from_icon_name("dialog-warning-symbolic"));
@@ -370,7 +376,7 @@ fn progress_page(
         .build();
     toolbar.set_content(Some(&status));
 
-    let total = restore::restore_steps(&found.set);
+    let total = restore::restore_steps(&found);
     let (tx, rx) = mpsc::channel::<RestoreEvent>();
     let current = Rc::new(Cell::new(None::<usize>));
     let start = Instant::now();
@@ -420,8 +426,8 @@ fn progress_page(
             }
         });
     }
-    let (set_path, target) = (found.path.clone(), disk.path.clone());
-    gio::spawn_blocking(move || restore::run_restore(&set_path, &target, None, tx));
+    let (found, target) = ((*found).clone(), disk.path.clone());
+    gio::spawn_blocking(move || restore::run_restore(&found, &target, tx));
     page
 }
 

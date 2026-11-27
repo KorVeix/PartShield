@@ -946,6 +946,7 @@ mod tests {
             eprintln!("omitida: PARTSHIELD_GUI_E2E=1 y root");
             return;
         }
+        let _one = LOOPS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PARTSHIELD_SANDBOX", "1");
         let dir = tempfile::tempdir().unwrap();
         let sh = |c: &str| {
@@ -1031,56 +1032,104 @@ mod tests {
         );
     }
 
+    /// Las pruebas con loops montan bajo /run/partshield con el nombre del
+    /// loop: de una en una, o se pisan al reutilizar el kernel los nombres.
+    static LOOPS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn sh_out(c: &str) -> std::process::Output {
+        std::process::Command::new("sh")
+            .arg("-c")
+            .arg(c)
+            .output()
+            .unwrap()
+    }
+
+    fn sh(c: &str) -> String {
+        let o = sh_out(c);
+        assert!(
+            o.status.success(),
+            "{c}: {}",
+            String::from_utf8_lossy(&o.stderr)
+        );
+        String::from_utf8(o.stdout).unwrap().trim().to_string()
+    }
+
+    /// (inicio, tamaño, tipo, uuid) de cada partición de una imagen.
+    fn table_of(img: &str) -> Vec<(u64, u64, String, String)> {
+        let v: serde_json::Value = serde_json::from_str(&sh(&format!("sfdisk -J {img}"))).unwrap();
+        v["partitiontable"]["partitions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|p| {
+                (
+                    p["start"].as_u64().unwrap(),
+                    p["size"].as_u64().unwrap(),
+                    p["type"].as_str().unwrap().to_string(),
+                    p["uuid"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    /// Loop sobre la partición `n` de una imagen, por su desplazamiento
+    /// (sin depender de `partscan`).
+    fn part_loop(img: &str, n: usize) -> String {
+        let t = table_of(img);
+        sh(&format!(
+            "losetup -f --show --offset {} --sizelimit {} {img}",
+            t[n].0 * 512,
+            t[n].1 * 512
+        ))
+    }
+
+    fn restore_to(found: &crate::restore::FoundSet, disk: &str) -> Result<Vec<String>, String> {
+        let (tx, rx) = std::sync::mpsc::channel();
+        crate::restore::run_restore(found, Path::new(disk), tx);
+        rx.try_iter()
+            .find_map(|e| match e {
+                crate::restore::RestoreEvent::Finished(r) => Some(r),
+                _ => None,
+            })
+            .expect("sin evento final")
+    }
+
     /// Modo sencillo con loops, de punta a punta: copiar un disco con tabla
     /// GPT, una ext4 (sector a sector) y un Btrfs con @ y @home (send), y
-    /// restaurar el conjunto en otro disco. Necesita root y
-    /// PARTSHIELD_GUI_E2E=1.
+    /// restaurarlo en discos del mismo tamaño, mayor y menor, con conjunto
+    /// y sin él. Necesita root y PARTSHIELD_GUI_E2E=1.
     #[test]
-    fn whole_disk_backup_and_restore_on_loops() {
-        use crate::restore::{run_restore, BackupSet, RestoreEvent};
+    fn whole_disk_backup_and_restore_by_partitions_on_loops() {
+        use crate::restore::{sets_in, Source};
         if !nix_root() || std::env::var_os("PARTSHIELD_GUI_E2E").is_none() {
             eprintln!("omitida: PARTSHIELD_GUI_E2E=1 y root");
             return;
         }
+        let _one = LOOPS.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("PARTSHIELD_SANDBOX", "1");
         let dir = tempfile::tempdir().unwrap();
-        let try_sh = |c: &str| {
-            std::process::Command::new("sh")
-                .arg("-c")
-                .arg(c)
-                .output()
-                .unwrap()
-        };
-        let sh = |c: &str| {
-            let o = try_sh(c);
-            assert!(
-                o.status.success(),
-                "{c}: {}",
-                String::from_utf8_lossy(&o.stderr)
-            );
-            String::from_utf8(o.stdout).unwrap().trim().to_string()
-        };
-        let d = dir.path().display();
+        let d = dir.path().display().to_string();
+        // Imágenes dispersas: el Btrfs ocupa casi 3 GiB de partición pero
+        // solo unos megas de datos, así que cabe en un disco de 2 GiB.
         sh(&format!(
-            "truncate -s 600M {d}/src.img {d}/new.img && truncate -s 2G {d}/dst.img && \
+            "truncate -s 3G {d}/src.img {d}/igual.img && truncate -s 4G {d}/mayor.img && \
+             truncate -s 2G {d}/menor.img && truncate -s 1G {d}/pequeno.img && \
+             truncate -s 2G {d}/dst.img && \
              printf 'label: gpt\\n,64M\\n,\\n' | sfdisk -q {d}/src.img"
         ));
-        // Sin udev ni partscan (contenedores), cada partición va a su propio
-        // loop con --offset; vale igual para el disco nuevo, que aún no
-        // tiene tabla.
-        let table: serde_json::Value =
-            serde_json::from_str(&sh(&format!("sfdisk -J {d}/src.img"))).unwrap();
-        let part = |img: &str, n: usize| -> String {
-            let p = &table["partitiontable"]["partitions"][n];
-            sh(&format!(
-                "losetup -f --show --offset {} --sizelimit {} {d}/{img}",
-                p["start"].as_u64().unwrap() * 512,
-                p["size"].as_u64().unwrap() * 512
-            ))
-        };
-        let src = sh(&format!("losetup -f --show {d}/src.img"));
+        let src_img = format!("{d}/src.img");
+        let src = sh(&format!("losetup -f --show {src_img}"));
         let dst = sh(&format!("losetup -f --show {d}/dst.img"));
-        let (p1, p2) = (part("src.img", 0), part("src.img", 1));
+        // Con los nodos de partición del kernel (`partx`), los informes
+        // llevan los mismos nombres que la tabla, como en un disco de
+        // verdad. Si el kernel no los crea, loops con --offset.
+        let _ = sh_out(&format!("partx -u {src}"));
+        let real_nodes = Path::new(&format!("{src}p2")).exists();
+        let (p1, p2) = if real_nodes {
+            (format!("{src}p1"), format!("{src}p2"))
+        } else {
+            (part_loop(&src_img, 0), part_loop(&src_img, 1))
+        };
         sh(&format!(
             "mkfs.ext4 -q -L arranque {p1} && mkfs.btrfs -q -L linux {p2} && \
              mkfs.ext4 -q -L copias {dst} && \
@@ -1091,6 +1140,7 @@ mod tests {
         ));
         let uuid = sh(&format!("blkid -s UUID -o value {p2}"));
         let p1_hash = sh(&format!("sha256sum < {p1}"));
+        let src_table = table_of(&src_img);
 
         // ---- copia
         let vol = |path: &str, fstype: &str, size: u64| Volume {
@@ -1112,13 +1162,13 @@ mod tests {
         };
         let items = [
             located(vol(&p1, "ext4", 64 << 20), 0),
-            located(vol(&p2, "btrfs", 535 << 20), 1),
+            located(vol(&p2, "btrfs", 3007 << 20), 1),
         ];
         let disks = [PlanDisk {
             path: PathBuf::from(&src),
             model: Some("Disco de pruebas".into()),
             serial: Some("SERIE1234".into()),
-            size: 600 << 20,
+            size: 3 << 30,
             whole: true,
         }];
         let dest = Destination {
@@ -1131,14 +1181,18 @@ mod tests {
         };
         let (tx, rx) = std::sync::mpsc::channel();
         run_plan(&items, &disks, &dest, tx);
-        let mut done = Vec::new();
+        let mut valid = 0;
         let mut set_path = None;
-        let mut finished = false;
         for ev in rx.try_iter() {
             match ev {
-                PlanEvent::Done(i, r) => done.push((i, *r)),
-                PlanEvent::Set(r) => set_path = Some(r.unwrap()),
-                PlanEvent::Finished => finished = true,
+                PlanEvent::Done(_, r) => {
+                    if r.as_ref().as_ref().is_ok_and(|(rep, _)| {
+                        rep.error.is_none() && rep.verdict() == Verdict::Valid
+                    }) {
+                        valid += 1;
+                    }
+                }
+                PlanEvent::Set(r) => set_path = r.ok(),
                 _ => {}
             }
         }
@@ -1146,115 +1200,245 @@ mod tests {
             "/run/partshield/destino/{}",
             Path::new(&dst).file_name().unwrap().to_string_lossy()
         );
-        let cleanup = |extra: &[&str]| {
-            let _ = try_sh(&format!("umount {dmnt}"));
-            let _ = try_sh(&format!(
-                "losetup -d {src} {dst} {p1} {p2} {}",
-                extra.join(" ")
-            ));
-        };
-        if done.len() != 2 || !finished || set_path.is_none() {
-            cleanup(&[]);
-            panic!("la copia no terminó: {} partes", done.len());
-        }
-        for (i, r) in &done {
-            let ok = r
-                .as_ref()
-                .is_ok_and(|(rep, _)| rep.error.is_none() && rep.verdict() == Verdict::Valid);
-            if !ok {
-                cleanup(&[]);
-                panic!(
-                    "parte {i}: {:?}",
-                    r.as_ref().map(|(rep, _)| rep.verification.clone())
-                );
-            }
-        }
-        let set_path = set_path.unwrap();
-        let set = BackupSet::load(&set_path).unwrap();
-        assert_eq!(set.verdict(), SetVerdict::Valid);
-        assert_eq!(set.not_restorable(), None);
-        assert_eq!(set.disk.serial.as_deref(), Some("SERIE1234"));
-        assert_eq!(set.parts.len(), 2);
-        assert_eq!(set.parts[1].default_subvolume, None);
-
-        // ---- restauración en un disco nuevo. El original se desconecta:
-        // dos Btrfs con el mismo UUID a la vez no pueden convivir.
-        let _ = try_sh(&format!("losetup -d {src} {p1} {p2}"));
-        let new = sh(&format!("losetup -f --show {d}/new.img"));
-        let (n1, n2) = (part("new.img", 0), part("new.img", 1));
-        let restore = |set_path: &Path| {
-            let (tx, rx) = std::sync::mpsc::channel();
-            run_restore(
-                set_path,
-                Path::new(&new),
-                Some(vec![PathBuf::from(&n1), PathBuf::from(&n2)]),
-                tx,
-            );
-            rx.try_iter()
-                .find_map(|e| match e {
-                    RestoreEvent::Finished(r) => Some(r),
-                    _ => None,
-                })
-                .expect("sin evento final")
-        };
-
-        // Un archivo de la copia dañado: no se escribe nada en el disco.
-        let stream = sh(&format!("ls {dmnt}/partshield-copias/*.raw.zst"));
-        sh(&format!(
-            "cp {stream} {d}/bueno.zst && printf 'X' | dd of={stream} bs=1 seek=100 conv=notrunc status=none"
+        let copies = PathBuf::from(&dmnt).join("partshield-copias");
+        // El original se desconecta: dos Btrfs con el mismo UUID no conviven.
+        // Y se borra la caché de blkid, que recordaría el loop ya suelto.
+        let forget = "rm -f /run/blkid/blkid.tab /run/blkid/blkid.tab.old";
+        let _ = sh_out(&format!(
+            "partx -d {src}; losetup -d {src} {p1} {p2}; {forget}"
         ));
-        let bad = restore(&set_path);
-        let untouched = try_sh(&format!("sfdisk -J {new}"));
-        sh(&format!("cp {d}/bueno.zst {stream}"));
-        let good = restore(&set_path);
 
-        let checks = (|| -> Result<(), String> {
-            let e = bad.as_ref().err().ok_or("la copia dañada se restauró")?;
-            if !e.contains("no se ha escrito nada") {
-                return Err(format!("mensaje inesperado: {e}"));
-            }
-            if untouched.status.success() {
-                return Err("el disco tenía tabla tras la restauración fallida".into());
-            }
-            good.as_ref().map_err(|e| format!("restaurar falló: {e}"))?;
-            let parts = |img: &str| -> Vec<(u64, u64, String, String)> {
-                let v: serde_json::Value =
-                    serde_json::from_str(&sh(&format!("sfdisk -J {d}/{img}"))).unwrap();
-                v["partitiontable"]["partitions"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .map(|p| {
-                        (
-                            p["start"].as_u64().unwrap(),
-                            p["size"].as_u64().unwrap(),
-                            p["type"].as_str().unwrap().to_string(),
-                            p["uuid"].as_str().unwrap().to_string(),
-                        )
-                    })
-                    .collect()
+        // Una restauración y sus comprobaciones; devuelve el error si falla.
+        let check =
+            |found: &crate::restore::FoundSet, img: &str, shrunk: bool| -> Result<(), String> {
+                let disk = sh(&format!("losetup -f --show {d}/{img}"));
+                let r = restore_to(found, &disk);
+                let _ = sh_out(&format!("losetup -d {disk}"));
+                r.map_err(|e| format!("{img}: restaurar falló: {e}"))?;
+                let t = table_of(&format!("{d}/{img}"));
+                if t.len() != 2 || t[0] != src_table[0] {
+                    return Err(format!("{img}: la primera partición no es igual"));
+                }
+                let same_last = t[1] == src_table[1];
+                let ids_kept = (t[1].0, &t[1].2, &t[1].3)
+                    == (src_table[1].0, &src_table[1].2, &src_table[1].3);
+                if shrunk && !(ids_kept && t[1].1 < src_table[1].1) {
+                    return Err(format!(
+                        "{img}: la última partición no se encogió bien: {t:?}"
+                    ));
+                }
+                if !shrunk && !same_last {
+                    return Err(format!("{img}: la tabla no es igual: {t:?}"));
+                }
+                let (n1, n2) = (
+                    part_loop(&format!("{d}/{img}"), 0),
+                    part_loop(&format!("{d}/{img}"), 1),
+                );
+                let out = (|| {
+                    if sh(&format!("sha256sum < {n1}")) != p1_hash {
+                        return Err(format!("{img}: la ext4 no es idéntica"));
+                    }
+                    if sh(&format!("blkid -s UUID -o value {n2}")) != uuid {
+                        return Err(format!("{img}: el Btrfs no tiene el UUID original"));
+                    }
+                    let o = sh_out(&format!(
+                    "m=$(mktemp -d) && mount -o ro {n2} $m && \
+                     cmp $m/@/datos.bin {d}/datos.bin && cat $m/@home/ana/nota.txt && \
+                     btrfs subvolume list $m | awk '{{print $NF}}' | sort | tr '\\n' ' '; umount $m"
+                ));
+                    let text = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                    if text != "hola\n@ @home" {
+                        return Err(format!("{img}: contenido del Btrfs: {text:?}"));
+                    }
+                    Ok(())
+                })();
+                // Suelta los loops y borra la caché de blkid: la siguiente
+                // restauración pondrá el mismo UUID en otro disco.
+                let _ = sh_out(&format!("losetup -d {n1} {n2}; {forget}"));
+                out
             };
-            if parts("src.img") != parts("new.img") {
-                return Err("la tabla restaurada no es igual".into());
+
+        let result = (|| -> Result<(), String> {
+            if valid != 2 {
+                return Err(format!("la copia no salió válida: {valid} de 2 partes"));
             }
-            if sh(&format!("sha256sum < {n1}")) != p1_hash {
-                return Err("la ext4 restaurada no es idéntica".into());
+            let set_path = set_path.clone().ok_or("no se escribió el conjunto")?;
+            let found = sets_in(&copies, Path::new(&dst));
+            if found.len() != 1 || found[0].source != Source::SetFile {
+                return Err(format!("conjuntos encontrados: {}", found.len()));
             }
-            if sh(&format!("blkid -s UUID -o value {n2}")) != uuid {
-                return Err("el Btrfs restaurado no tiene el UUID original".into());
+            let f = &found[0];
+            if f.not_restorable().is_some() || f.set.verdict() != SetVerdict::Valid {
+                return Err("el conjunto no sale restaurable y válido".into());
             }
-            let out = sh(&format!(
-                "m=$(mktemp -d) && mount -o ro {n2} $m && \
-                 cmp $m/@/datos.bin {d}/datos.bin && cat $m/@home/ana/nota.txt && \
-                 btrfs subvolume list $m | awk '{{print $NF}}' | sort | tr '\\n' ' '; umount $m"
+            if f.set.disk.serial.as_deref() != Some("SERIE1234") {
+                return Err("el conjunto no guarda el número de serie".into());
+            }
+            if f.min_size >= 2 << 30 {
+                return Err(format!("tamaño mínimo mal calculado: {}", f.min_size));
+            }
+
+            // Un archivo de la copia dañado: no se escribe nada en el disco.
+            let stream = sh(&format!("ls {}/*.raw.zst", copies.display()));
+            sh(&format!(
+                "cp {stream} {d}/bueno.zst && \
+                 printf 'X' | dd of={stream} bs=1 seek=100 conv=notrunc status=none"
             ));
-            if out != "hola\n@ @home" {
-                return Err(format!("contenido del Btrfs restaurado: {out:?}"));
+            let disk = sh(&format!("losetup -f --show {d}/igual.img"));
+            let bad = restore_to(f, &disk);
+            let untouched = sh_out(&format!("sfdisk -J {disk}"));
+            let _ = sh_out(&format!("losetup -d {disk}"));
+            sh(&format!("cp {d}/bueno.zst {stream}"));
+            let e = bad.err().ok_or("la copia dañada se restauró")?;
+            if !e.contains("no se ha escrito nada") || untouched.status.success() {
+                return Err(format!("copia dañada: {e}"));
+            }
+
+            // Demasiado pequeño incluso encogiendo el Btrfs: se rechaza antes.
+            let disk = sh(&format!("losetup -f --show {d}/pequeno.img"));
+            let small = restore_to(f, &disk);
+            let untouched = sh_out(&format!("sfdisk -J {disk}"));
+            let _ = sh_out(&format!("losetup -d {disk}"));
+            let e = small.err().ok_or("se restauró en un disco donde no cabe")?;
+            if !e.contains("demasiado pequeño") || untouched.status.success() {
+                return Err(format!("disco pequeño: {e}"));
+            }
+
+            check(f, "igual.img", false)?;
+            check(f, "mayor.img", false)?;
+            check(f, "menor.img", true)?;
+
+            // Sin conjunto (copias de la ISO anterior): se adopta la tabla
+            // con los informes de sus particiones.
+            if !real_nodes {
+                eprintln!("sin nodos de partición: no se prueba la copia sin conjunto");
+                return Ok(());
+            }
+            sh(&format!("mv {} {d}/", set_path.display()));
+            let found = sets_in(&copies, Path::new(&dst));
+            if found.len() != 1 || found[0].source != Source::Adopted {
+                return Err(format!("copias adoptadas: {}", found.len()));
+            }
+            let f = &found[0];
+            if f.set.parts.len() != 2 || f.not_restorable().is_some() {
+                return Err(format!("copia adoptada incompleta: {:?}", f.set.parts));
+            }
+            sh(&format!(
+                "truncate -s 0 {d}/igual.img && truncate -s 3G {d}/igual.img"
+            ));
+            check(f, "igual.img", false)
+        })();
+        let _ = sh_out(&format!("umount {dmnt}; losetup -d {dst}"));
+        result.unwrap();
+    }
+
+    /// Disco entero en un solo archivo: se reconoce por su tabla GPT (una
+    /// imagen de partición suelta no se ofrece) y se restaura en un disco
+    /// igual o mayor; en uno menor se rechaza sin escribir.
+    #[test]
+    fn whole_disk_image_restore_on_loops() {
+        use crate::restore::{sets_in, Source};
+        if !nix_root() || std::env::var_os("PARTSHIELD_GUI_E2E").is_none() {
+            eprintln!("omitida: PARTSHIELD_GUI_E2E=1 y root");
+            return;
+        }
+        let _one = LOOPS.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("PARTSHIELD_SANDBOX", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display().to_string();
+        sh(&format!(
+            "truncate -s 400M {d}/src.img {d}/igual.img && truncate -s 600M {d}/mayor.img && \
+             truncate -s 300M {d}/menor.img && mkdir {d}/copias && \
+             printf 'label: gpt\\n,64M\\n,\\n' | sfdisk -q {d}/src.img"
+        ));
+        let src_img = format!("{d}/src.img");
+        let (p1, p2) = (part_loop(&src_img, 0), part_loop(&src_img, 1));
+        sh(&format!(
+            "mkfs.ext4 -q {p1} && mkfs.ext4 -q {p2} && m=$(mktemp -d) && mount {p2} $m && \
+             head -c 3M /dev/urandom > $m/datos.bin && umount $m"
+        ));
+        let hashes = (
+            sh(&format!("sha256sum < {p1}")),
+            sh(&format!("sha256sum < {p2}")),
+        );
+        let src = sh(&format!("losetup -f --show {src_img}"));
+        let copies = PathBuf::from(format!("{d}/copias"));
+        let backup = |device: &str| {
+            backup_raw(
+                &mut Session::new(false),
+                &RawOptions {
+                    device: Path::new(device),
+                    dest_dir: &copies,
+                    scratch_dir: None,
+                    zstd_level: 3,
+                    hash: HashAlgo::Blake3,
+                    sign_key: None,
+                },
+            )
+        };
+        // El disco entero y, aparte, una partición suelta.
+        let whole = backup(&src);
+        let single = backup(&p1);
+        let _ = sh_out(&format!("losetup -d {src} {p1} {p2}"));
+        let src_table = table_of(&src_img);
+
+        let result = (|| -> Result<(), String> {
+            let (report, _) = whole.map_err(|e| format!("copia del disco: {e:#}"))?;
+            single.map_err(|e| format!("copia de la partición: {e:#}"))?;
+            if report.verdict() != Verdict::Valid {
+                return Err(format!(
+                    "la imagen del disco no es válida: {:?}",
+                    report.verification
+                ));
+            }
+            let found = sets_in(&copies, Path::new("/dev/null"));
+            if found.len() != 1 || found[0].source != Source::Image {
+                return Err(format!(
+                    "se esperaba solo la imagen del disco: {:?}",
+                    found.iter().map(|f| &f.source).collect::<Vec<_>>()
+                ));
+            }
+            let f = &found[0];
+            if f.set.verdict() != SetVerdict::Valid || f.min_size != 400 << 20 {
+                return Err(format!("imagen mal descrita: {} bytes", f.min_size));
+            }
+
+            let disk = sh(&format!("losetup -f --show {d}/menor.img"));
+            let small = restore_to(f, &disk);
+            let untouched = sh_out(&format!("sfdisk -J {disk}"));
+            let _ = sh_out(&format!("losetup -d {disk}"));
+            let e = small.err().ok_or("se restauró en un disco menor")?;
+            if !e.contains("No se ha escrito nada") || untouched.status.success() {
+                return Err(format!("disco menor: {e}"));
+            }
+
+            for img in ["igual.img", "mayor.img"] {
+                let disk = sh(&format!("losetup -f --show {d}/{img}"));
+                let r = restore_to(f, &disk);
+                let gpt = sh_out(&format!("sgdisk -v {disk}"));
+                let _ = sh_out(&format!("losetup -d {disk}"));
+                r.map_err(|e| format!("{img}: {e}"))?;
+                let gpt = String::from_utf8_lossy(&gpt.stdout).to_string();
+                if !gpt.contains("No problems found") {
+                    return Err(format!("{img}: la tabla GPT tiene problemas: {gpt}"));
+                }
+                let path = format!("{d}/{img}");
+                if table_of(&path) != src_table {
+                    return Err(format!("{img}: la tabla no es igual"));
+                }
+                let (n1, n2) = (part_loop(&path, 0), part_loop(&path, 1));
+                let got = (
+                    sh(&format!("sha256sum < {n1}")),
+                    sh(&format!("sha256sum < {n2}")),
+                );
+                let _ = sh_out(&format!("losetup -d {n1} {n2}"));
+                if got != hashes {
+                    return Err(format!("{img}: las particiones no son idénticas"));
+                }
             }
             Ok(())
         })();
-        cleanup(&[&new, &n1, &n2]);
-        checks.unwrap();
+        result.unwrap();
     }
 
     #[test]
