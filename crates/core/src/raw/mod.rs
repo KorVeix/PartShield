@@ -20,10 +20,8 @@ use serde::Deserialize;
 
 use crate::cmd::{guard_path, Cmd, Session};
 use crate::detect::blockdev::mounts_below;
-use crate::detect::SuperblockExt;
 use crate::types::{
-    Artifact, Digest, HashAlgo, Hasher, RawImage, Step, StepStatus, StreamRef, Superblock,
-    Verification,
+    Artifact, Digest, HashAlgo, Hasher, RawImage, Step, StepStatus, StreamRef, Verification,
 };
 use crate::verify::{verdict_of, COMPARACION, ESTRUCTURA, MONTAJE, MUESTRA, RESTAURAR};
 
@@ -264,7 +262,6 @@ pub fn verify(
         mountpoint: tempfile::Builder::new()
             .prefix("partshield-mnt-")
             .tempdir()?,
-        mounted: false,
     };
     let mut steps = Vec::new();
     let mut push = |name, status, detail: String| {
@@ -304,39 +301,23 @@ pub fn verify(
     };
     push(RESTAURAR, restore_ok.0, restore_ok.1);
 
-    // 2. estructura y 3. montaje, solo con una imagen completa.
+    // 2. estructura y 3. montaje, solo con una imagen completa. Una imagen
+    //    de disco entero se comprueba partición a partición.
     if restored.is_ok() {
-        let is_btrfs = Superblock::read_from(&scratch.image).is_ok();
         match scratch.attach(s) {
             Err(e) => {
                 push(ESTRUCTURA, StepStatus::Failed, format!("{e:#}"));
                 push(MONTAJE, StepStatus::Failed, format!("{e:#}"));
             }
             Ok(dev) => {
-                if is_btrfs {
-                    match s.run(Cmd::new("btrfs").arg("check").arg("--readonly").arg(&dev)) {
-                        Ok(_) => push(
-                            ESTRUCTURA,
-                            StepStatus::Passed,
-                            "btrfs check --readonly sin errores".into(),
-                        ),
-                        Err(e) => push(ESTRUCTURA, StepStatus::Failed, format!("{e:#}")),
-                    }
+                let mnt = scratch.mountpoint.path().to_path_buf();
+                let (structure, mount) = if is_partitioned(s, &dev) {
+                    check_partitions(s, &scratch.image, &mnt)
                 } else {
-                    let (status, detail) = structure_check(s, &dev);
-                    push(ESTRUCTURA, status, detail);
-                }
-                match mountable(s, &dev) {
-                    Some(why_not) => push(MONTAJE, StepStatus::Skipped, why_not),
-                    None => match scratch.mount_ro(s, &dev) {
-                        Ok(()) => push(
-                            MONTAJE,
-                            StepStatus::Passed,
-                            "montada en solo lectura".into(),
-                        ),
-                        Err(e) => push(MONTAJE, StepStatus::Failed, format!("{e:#}")),
-                    },
-                }
+                    check_filesystem(s, &dev, &mnt)
+                };
+                push(ESTRUCTURA, structure.0, structure.1);
+                push(MONTAJE, mount.0, mount.1);
             }
         }
     } else {
@@ -486,8 +467,8 @@ impl<W: Write> Write for Tee<W> {
     }
 }
 
-/// Comprobador de solo lectura de cada sistema de archivos que no es Btrfs:
-/// programa y argumentos (sin el dispositivo).
+/// Comprobador de solo lectura de cada sistema de archivos: programa y
+/// argumentos (sin el dispositivo).
 fn fs_checker(fstype: &str) -> Option<(&'static str, &'static [&'static str])> {
     Some(match fstype {
         "ext2" | "ext3" | "ext4" => ("e2fsck", &["-f", "-n"]),
@@ -495,12 +476,12 @@ fn fs_checker(fstype: &str) -> Option<(&'static str, &'static [&'static str])> {
         "exfat" => ("fsck.exfat", &["-n"]),
         "xfs" => ("xfs_repair", &["-n"]),
         "ntfs" => ("ntfsfix", &["--no-action"]),
+        "btrfs" => ("btrfs", &["check", "--readonly"]),
         _ => return None,
     })
 }
 
-/// Paso «estructura» de una imagen que no es Btrfs: el fsck de su sistema
-/// de archivos en modo solo lectura. Sin comprobador conocido (o sin el
+/// Paso «estructura»: el fsck del sistema de archivos en modo solo lectura. Sin comprobador conocido (o sin el
 /// programa instalado) se omite, y la copia queda en «reducida».
 fn structure_check(s: &mut Session, dev: &str) -> (StepStatus, String) {
     let fstype = s
@@ -515,6 +496,19 @@ fn structure_check(s: &mut Session, dev: &str) -> (StepStatus, String) {
                 .into(),
         );
     };
+    if fstype == "BitLocker" {
+        return (
+            StepStatus::Skipped,
+            "cifrada con BitLocker: no se puede comprobar por dentro; la comparación bit \
+             a bit cubre el contenido. Guarda la clave de recuperación de BitLocker"
+                .into(),
+        );
+    }
+    if fstype == "ntfs" {
+        if let Some(why) = ntfs_not_clean(s, dev) {
+            return (StepStatus::Skipped, why);
+        }
+    }
     let Some((prog, args)) = fs_checker(&fstype) else {
         return (
             StepStatus::Skipped,
@@ -547,6 +541,174 @@ fn structure_check(s: &mut Session, dev: &str) -> (StepStatus, String) {
     }
 }
 
+/// Por qué un NTFS no está cerrado limpiamente, o `None` si lo está (o no
+/// se puede saber). Windows hibernado o apagado con el inicio rápido deja
+/// el NTFS a medias: la copia sería fiel, pero de un sistema sin cerrar.
+pub fn ntfs_not_clean(s: &mut Session, dev: &str) -> Option<String> {
+    let out = s
+        .run_unchecked(&Cmd::new("ntfs-3g.probe").arg("--readwrite").arg(dev))
+        .ok()?;
+    match out.code {
+        Some(14) => Some(
+            "Windows está hibernado o se apagó con el inicio rápido: el NTFS no está \
+             cerrado. Arranca Windows, apágalo del todo (shutdown /s /t 0) y repite la copia"
+                .into(),
+        ),
+        Some(15) => Some(
+            "el NTFS no se cerró limpiamente (diario sin vaciar). Arranca Windows, \
+             apágalo del todo (shutdown /s /t 0) y repite la copia"
+                .into(),
+        ),
+        _ => None,
+    }
+}
+
+/// `dev` tiene tabla de particiones y ningún sistema de archivos propio.
+fn is_partitioned(s: &mut Session, dev: &str) -> bool {
+    let Ok(out) = s.run_unchecked(&Cmd::new("blkid").arg("-p").arg("-o").arg("export").arg(dev))
+    else {
+        return false;
+    };
+    let (_, fstype) = crate::detect::blockdev::parse_blkid_export(&out.stdout);
+    fstype.is_none() && out.stdout.lines().any(|l| l.starts_with("PTTYPE="))
+}
+
+type StepResult = (StepStatus, String);
+
+/// Estructura y montaje (solo lectura, y se desmonta) del sistema de
+/// archivos de `dev`.
+fn check_filesystem(s: &mut Session, dev: &str, mnt: &Path) -> (StepResult, StepResult) {
+    let structure = structure_check(s, dev);
+    let mount = match mountable(s, dev) {
+        Some(why_not) => (StepStatus::Skipped, why_not),
+        None => match s.run(Cmd::new("mount").arg("-o").arg("ro").arg(dev).arg(mnt)) {
+            Ok(_) => match s.run(Cmd::new("umount").arg(mnt)) {
+                Ok(_) => (StepStatus::Passed, "montada en solo lectura".into()),
+                Err(e) => (StepStatus::Failed, format!("{e:#}")),
+            },
+            Err(e) => (StepStatus::Failed, format!("{e:#}")),
+        },
+    };
+    (structure, mount)
+}
+
+#[derive(Deserialize)]
+struct SfdiskDump {
+    partitiontable: SfdiskTable,
+}
+
+#[derive(Deserialize)]
+struct SfdiskTable {
+    #[serde(default = "default_sector")]
+    sectorsize: u64,
+    #[serde(default)]
+    partitions: Vec<SfdiskPart>,
+}
+
+#[derive(Deserialize)]
+struct SfdiskPart {
+    start: u64,
+    size: u64,
+}
+
+fn default_sector() -> u64 {
+    512
+}
+
+/// Estructura y montaje de cada partición de una imagen de disco entero.
+/// Cada partición se enlaza a su propio loop de solo lectura con
+/// `--offset`, sin depender de que el kernel lea la tabla.
+///
+/// Las particiones sin sistema de archivos (reservadas, sin formato) y la
+/// swap no cuentan. Pasa si todas las demás pasan; una que no se puede
+/// mirar (cifrada, desconocida, NTFS sin cerrar) lo deja en «omitido».
+fn check_partitions(s: &mut Session, image: &Path, mnt: &Path) -> (StepResult, StepResult) {
+    let table = s
+        .run(Cmd::new("sfdisk").arg("--json").arg(image))
+        .and_then(|j| Ok(serde_json::from_str::<SfdiskDump>(&j)?));
+    let table = match table {
+        Ok(t) => t.partitiontable,
+        Err(e) => {
+            let why = format!("no se pudo leer la tabla de particiones de la imagen: {e:#}");
+            return ((StepStatus::Failed, why.clone()), (StepStatus::Failed, why));
+        }
+    };
+    let (mut structure, mut mount) = (Vec::new(), Vec::new());
+    for (i, p) in table.partitions.iter().enumerate() {
+        let n = i + 1;
+        let dev = s.run(
+            Cmd::new("losetup")
+                .arg("--find")
+                .arg("--show")
+                .arg("--read-only")
+                .arg("--offset")
+                .arg((p.start * table.sectorsize).to_string())
+                .arg("--sizelimit")
+                .arg((p.size * table.sectorsize).to_string())
+                .arg(image),
+        );
+        let dev = match dev {
+            Ok(d) => d.trim().to_string(),
+            Err(e) => {
+                structure.push((n, StepStatus::Failed, format!("{e:#}")));
+                continue;
+            }
+        };
+        let fstype = s
+            .run_unchecked(
+                &Cmd::new("blkid")
+                    .arg("-p")
+                    .arg("-o")
+                    .arg("export")
+                    .arg(&dev),
+            )
+            .ok()
+            .and_then(|o| crate::detect::blockdev::parse_blkid_export(&o.stdout).1);
+        if !matches!(fstype.as_deref(), None | Some("swap")) {
+            let (st, mo) = check_filesystem(s, &dev, mnt);
+            structure.push((n, st.0, st.1));
+            mount.push((n, mo.0, mo.1));
+        }
+        let _ = s.run(Cmd::new("losetup").arg("--detach").arg(&dev));
+    }
+    (
+        merge_partition_results(&structure),
+        merge_partition_results(&mount),
+    )
+}
+
+/// Un fallo manda; si no, una omisión; si no, todo pasó.
+fn merge_partition_results(results: &[(usize, StepStatus, String)]) -> StepResult {
+    if results.is_empty() {
+        return (
+            StepStatus::Skipped,
+            "ninguna partición tiene un sistema de archivos que comprobar; la comparación \
+             bit a bit cubre el contenido"
+                .into(),
+        );
+    }
+    let status = if results.iter().any(|r| r.1 == StepStatus::Failed) {
+        StepStatus::Failed
+    } else if results.iter().any(|r| r.1 == StepStatus::Skipped) {
+        StepStatus::Skipped
+    } else {
+        StepStatus::Passed
+    };
+    let detail = results
+        .iter()
+        .map(|(n, st, d)| {
+            let mark = match st {
+                StepStatus::Passed => "",
+                StepStatus::Skipped => "OMITIDO: ",
+                StepStatus::Failed => "FALLÓ: ",
+            };
+            format!("partición {n}: {mark}{d}")
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    (status, detail)
+}
+
 /// Imagen temporal + loop de solo lectura + montaje, liberados siempre.
 /// `None` si `dev` tiene un sistema de archivos que montar; si no, por qué
 /// se omite el montaje (un disco entero con tabla de particiones, swap…).
@@ -562,10 +724,12 @@ fn mountable(s: &mut Session, dev: &str) -> Option<String> {
         .find_map(|l| l.strip_prefix("PTTYPE="))
         .map(str::to_string);
     match (fstype.as_deref(), pttype) {
-        (Some("swap" | "crypto_LUKS" | "LVM2_member" | "linux_raid_member"), _) => Some(format!(
-            "contiene {}, que no se monta; la comparación bit a bit cubre el contenido",
-            fstype.unwrap_or_default()
-        )),
+        (Some("swap" | "crypto_LUKS" | "LVM2_member" | "linux_raid_member" | "BitLocker"), _) => {
+            Some(format!(
+                "contiene {}, que no se monta; la comparación bit a bit cubre el contenido",
+                fstype.unwrap_or_default()
+            ))
+        }
         (Some(_), _) => None,
         (None, Some(pt)) => Some(format!(
             "es un disco entero con tabla de particiones {pt}; no se monta cada \
@@ -585,7 +749,6 @@ struct Scratch {
     _dir: tempfile::TempDir,
     loopdev: Option<String>,
     mountpoint: tempfile::TempDir,
-    mounted: bool,
 }
 
 impl Scratch {
@@ -602,25 +765,13 @@ impl Scratch {
         Ok(dev)
     }
 
-    fn mount_ro(&mut self, s: &mut Session, dev: &str) -> Result<()> {
-        s.run(
-            Cmd::new("mount")
-                .arg("-o")
-                .arg("ro")
-                .arg(dev)
-                .arg(self.mountpoint.path()),
-        )?;
-        self.mounted = true;
-        Ok(())
-    }
-
     fn cleanup(&mut self, s: &mut Session) {
-        if self.mounted
-            && s.run(Cmd::new("umount").arg(self.mountpoint.path()))
-                .is_ok()
-        {
-            self.mounted = false;
-        }
+        // Por si un montaje de comprobación quedó a medias.
+        let _ = s.run_unchecked(
+            &Cmd::new("umount")
+                .arg("--quiet")
+                .arg(self.mountpoint.path()),
+        );
         if let Some(dev) = self.loopdev.take() {
             let _ = s.run(Cmd::new("losetup").arg("--detach").arg(dev));
         }
@@ -631,9 +782,10 @@ impl Scratch {
 impl Drop for Scratch {
     fn drop(&mut self) {
         use std::process::Command;
-        if self.mounted {
-            let _ = Command::new("umount").arg(self.mountpoint.path()).status();
-        }
+        let _ = Command::new("umount")
+            .arg("--quiet")
+            .arg(self.mountpoint.path())
+            .status();
         if let Some(dev) = self.loopdev.take() {
             let _ = Command::new("losetup").arg("--detach").arg(dev).status();
         }

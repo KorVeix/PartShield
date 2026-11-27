@@ -34,10 +34,23 @@ pub struct Volume {
     pub fstype: Option<String>,
     pub label: Option<String>,
     pub uuid: Option<String>,
+    /// GUID (GPT) o código (MBR) del tipo de partición, en minúsculas.
+    pub parttype: Option<String>,
     pub mountpoints: Vec<String>,
 }
 
+/// Partición reservada de Microsoft (MSR): sin datos del usuario.
+const GPT_MSR: &str = "e3c9e316-0b5c-4db8-817d-f92df00215ae";
+
 impl Volume {
+    pub fn is_msr(&self) -> bool {
+        self.parttype.as_deref() == Some(GPT_MSR)
+    }
+
+    pub fn is_bitlocker(&self) -> bool {
+        self.fstype.as_deref() == Some("BitLocker")
+    }
+
     pub fn is_btrfs(&self) -> bool {
         self.fstype.as_deref() == Some("btrfs")
     }
@@ -58,7 +71,7 @@ impl Volume {
 }
 
 pub const LSBLK_COLUMNS: &str =
-    "NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS";
+    "NAME,PATH,TYPE,SIZE,FSTYPE,LABEL,UUID,PARTTYPE,MODEL,SERIAL,TRAN,RM,MOUNTPOINTS";
 
 pub fn list(s: &mut Session) -> Result<Vec<Disk>> {
     let out = s.run(
@@ -88,24 +101,41 @@ fn fill_missing_fstypes(s: &mut Session, disks: &mut [Disk]) {
                     fstype: Some(fstype),
                     label: None,
                     uuid,
+                    parttype: None,
                     mountpoints: Vec::new(),
                 });
             }
         }
-        for v in disk.volumes.iter_mut().filter(|v| v.fstype.is_none()) {
-            if let Some((fstype, uuid)) = probe(s, &v.path) {
-                v.fstype = Some(fstype);
+        for v in disk.volumes.iter_mut() {
+            if v.fstype.is_some() && (v.parttype.is_some() || v.kind != "part") {
+                continue;
+            }
+            let Some(out) = blkid_export(s, &v.path) else {
+                continue;
+            };
+            let (uuid, fstype) = super::blockdev::parse_blkid_export(&out);
+            if v.fstype.is_none() {
+                v.fstype = fstype;
                 v.uuid = v.uuid.take().or(uuid);
+            }
+            if v.parttype.is_none() {
+                v.parttype = out
+                    .lines()
+                    .find_map(|l| l.strip_prefix("PART_ENTRY_TYPE="))
+                    .map(|t| t.trim().to_lowercase());
             }
         }
     }
 }
 
+fn blkid_export(s: &mut Session, dev: &std::path::Path) -> Option<String> {
+    s.run_unchecked(&Cmd::new("blkid").arg("-p").arg("-o").arg("export").arg(dev))
+        .ok()
+        .map(|o| o.stdout)
+}
+
 fn probe(s: &mut Session, dev: &std::path::Path) -> Option<(String, Option<String>)> {
-    let out = s
-        .run_unchecked(&Cmd::new("blkid").arg("-p").arg("-o").arg("export").arg(dev))
-        .ok()?;
-    let (uuid, fstype) = super::blockdev::parse_blkid_export(&out.stdout);
+    let (uuid, fstype) = super::blockdev::parse_blkid_export(&blkid_export(s, dev)?);
     fstype.map(|f| (f, uuid))
 }
 
@@ -165,6 +195,7 @@ fn volume(v: &Value, depth: usize) -> Volume {
         fstype: text(v, "fstype"),
         label: text(v, "label"),
         uuid: text(v, "uuid"),
+        parttype: text(v, "parttype").map(|t| t.to_lowercase()),
         mountpoints: v["mountpoints"]
             .as_array()
             .into_iter()

@@ -402,6 +402,8 @@ pub fn disk_title(d: &Disk) -> String {
 pub fn volume_title(v: &Volume) -> String {
     let small = v.size < (2 << 30);
     let what = match v.fstype.as_deref() {
+        _ if v.is_msr() => "Reservada de Microsoft (MSR)",
+        Some("BitLocker") => "Windows cifrado (BitLocker)",
         Some("ntfs") if small => "Recuperación de Windows",
         Some("ntfs") => "Windows (NTFS)",
         Some("vfat") if small => "Arranque (EFI)",
@@ -448,9 +450,10 @@ pub fn default_disk(disks: &[&Disk]) -> Option<PathBuf> {
         .map(|d| d.path.clone())
 }
 
-/// Marcada al marcar el disco entero. La swap no: se rehace sola.
+/// Marcada al marcar el disco entero. La swap y la reservada de Microsoft
+/// no: no guardan datos y se rehacen solas.
 pub fn checked_with_disk(v: &Volume) -> bool {
-    v.fstype.as_deref() != Some("swap")
+    v.fstype.as_deref() != Some("swap") && !v.is_msr()
 }
 
 /// Una parte de la copia en el modo sencillo.
@@ -482,6 +485,88 @@ impl PlanItem {
             size
         }
     }
+}
+
+/// Espacio que hace falta en el destino, en el peor caso (sin comprimir).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SpaceNeed {
+    /// Las copias, que se quedan.
+    pub copies: u64,
+    /// El mayor temporal de comprobación: cada parte se restaura en el
+    /// propio destino para comprobarla y se borra al terminar.
+    pub scratch: u64,
+}
+
+impl SpaceNeed {
+    /// `parts`: lo que puede ocupar cada parte antes de comprimir.
+    pub fn of(parts: &[u64]) -> Self {
+        Self {
+            copies: parts.iter().sum(),
+            scratch: parts.iter().copied().max().unwrap_or(0),
+        }
+    }
+
+    pub fn total(&self) -> u64 {
+        self.copies.saturating_add(self.scratch)
+    }
+
+    pub fn fit(&self, free: Option<u64>) -> Fit {
+        match free {
+            None => Fit::Unknown,
+            Some(f) if f >= self.total() => Fit::Fits,
+            // Ni comprimiendo: el temporal de la mayor parte ya no entra.
+            Some(f) if f < self.scratch => Fit::No,
+            Some(_) => Fit::Tight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Fit {
+    Fits,
+    /// Depende de cuánto comprima.
+    Tight,
+    No,
+    Unknown,
+}
+
+/// Bytes libres del destino. Si no está montado, se monta un momento en
+/// solo lectura para medirlo y se desmonta.
+pub fn measure_free(dest: &Destination) -> Option<u64> {
+    if let Some(m) = &dest.mountpoint {
+        return free_bytes(m);
+    }
+    let mut s = Session::new(false);
+    let name = dest.device.file_name()?.to_string_lossy().into_owned();
+    let mnt = PathBuf::from(RUN_DIR).join("medir").join(name);
+    std::fs::create_dir_all(&mnt).ok()?;
+    s.run(
+        Cmd::new("mount")
+            .arg("-o")
+            .arg("ro")
+            .arg(&dest.device)
+            .arg(&mnt),
+    )
+    .ok()?;
+    let free = free_bytes(&mnt);
+    let _ = s.run_unchecked(&Cmd::new("umount").arg(&mnt));
+    free
+}
+
+/// Aviso de una partición antes de copiarla: NTFS sin cerrar o BitLocker.
+pub fn volume_warning(v: &Volume) -> Option<String> {
+    if v.is_bitlocker() {
+        return Some(
+            "Cifrada con BitLocker: se copia tal cual y no se puede comprobar por dentro. \
+             Ten a mano la clave de recuperación"
+                .into(),
+        );
+    }
+    if v.fstype.as_deref() == Some("ntfs") {
+        let mut s = Session::new(false);
+        return partshield_core::raw::ntfs_not_clean(&mut s, &v.path.display().to_string());
+    }
+    None
 }
 
 /// El resultado de una parte: su informe y dónde se guardó, o el error.
@@ -615,6 +700,20 @@ mod tests {
     }
 
     #[test]
+    fn space_counts_copies_plus_the_largest_scratch() {
+        let gib = 1u64 << 30;
+        // Windows 295 + Btrfs con 420 usados + EFI.
+        let need = SpaceNeed::of(&[295 * gib, 420 * gib, gib / 2]);
+        assert_eq!(need.copies, 715 * gib + gib / 2);
+        assert_eq!(need.scratch, 420 * gib);
+        assert_eq!(need.fit(Some(2000 * gib)), Fit::Fits);
+        assert_eq!(need.fit(Some(932 * gib)), Fit::Tight);
+        assert_eq!(need.fit(Some(400 * gib)), Fit::No);
+        assert_eq!(need.fit(None), Fit::Unknown);
+        assert_eq!(SpaceNeed::of(&[]).total(), 0);
+    }
+
+    #[test]
     fn friendly_names_for_common_partitions() {
         let v = |fstype: Option<&str>, size: u64, label: Option<&str>| Volume {
             path: PathBuf::from("/dev/x"),
@@ -624,6 +723,7 @@ mod tests {
             fstype: fstype.map(String::from),
             label: label.map(String::from),
             uuid: None,
+            parttype: None,
             mountpoints: vec![],
         };
         let gib = 1u64 << 30;
@@ -644,6 +744,14 @@ mod tests {
             "Linux (ext4)"
         );
         assert_eq!(volume_title(&v(None, gib, None)), "Sin formato");
+        let mut msr = v(None, gib / 64, None);
+        msr.parttype = Some("e3c9e316-0b5c-4db8-817d-f92df00215ae".into());
+        assert_eq!(volume_title(&msr), "Reservada de Microsoft (MSR)");
+        assert!(!checked_with_disk(&msr));
+        assert_eq!(
+            volume_title(&v(Some("BitLocker"), 200 * gib, None)),
+            "Windows cifrado (BitLocker)"
+        );
         assert!(!checked_with_disk(&v(Some("swap"), gib, None)));
         assert!(checked_with_disk(&v(Some("ntfs"), gib, None)));
     }
@@ -836,6 +944,7 @@ mod tests {
             fstype: Some(fstype.into()),
             label: None,
             uuid: None,
+            parttype: None,
             mountpoints: vec![],
         };
         let items = [
