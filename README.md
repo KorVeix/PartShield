@@ -30,6 +30,34 @@
 
 ---
 
+## Status: 0.1 alpha
+
+> **Alpha.** Don't use PartShield as your only backup yet. Before backing up
+> an NTFS partition, shut Windows down completely (`shutdown /s /t 0`):
+> hibernation and Fast Startup leave NTFS unclosed, and PartShield will not
+> mark such a backup as verified.
+
+**What it does today**
+
+- Backs up a whole disk or chosen partitions from the live USB: Btrfs via
+  `btrfs send`, everything else sector by sector, plus the partition table.
+- Verifies every backup by restoring it to scratch space: structure check,
+  read-only mount and comparison with the original. A whole-disk image is
+  checked partition by partition.
+- Warns about unclosed NTFS and BitLocker before copying, and never reports
+  those backups as verified.
+- Restores from the command line (`partshield restore`, `restore-layout`).
+
+**What it doesn't do yet**
+
+- **Restore from the GUI.** Restoring is command line only.
+- **Used-block images.** Sector-by-sector backups copy free space too, so a
+  half-empty NTFS partition takes as long as a full one.
+- **LUKS unlocking.** An encrypted partition is copied as is, still
+  encrypted, and can't be checked inside.
+
+These are planned for 0.2: see the [roadmap](ROADMAP.md).
+
 ## Why
 
 A backup isn't done until it has been restored.
@@ -140,8 +168,9 @@ a loop device. Read [CONTRIBUTING.md](CONTRIBUTING.md) before contributing.
 
 ## Roadmap
 
-What's next (restoring from the GUI, real percentage progress, LUKS, GParted
-on the ISO, English interface…) is in [ROADMAP.md](ROADMAP.md).
+What's planned for 0.2 (restoring from the GUI, used-block images, LUKS, real
+percentage progress, GParted on the ISO, English interface…) is in
+[ROADMAP.md](ROADMAP.md).
 
 ## License
 

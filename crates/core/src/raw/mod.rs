@@ -505,8 +505,11 @@ fn structure_check(s: &mut Session, dev: &str) -> (StepStatus, String) {
         );
     }
     if fstype == "ntfs" {
-        if let Some(why) = ntfs_not_clean(s, dev) {
-            return (StepStatus::Skipped, why);
+        match ntfs_state(s, Path::new(dev)) {
+            NtfsState::Clean => {}
+            NtfsState::NotClean(why) | NtfsState::Unknown(why) => {
+                return (StepStatus::Skipped, why)
+            }
         }
     }
     let Some((prog, args)) = fs_checker(&fstype) else {
@@ -541,25 +544,58 @@ fn structure_check(s: &mut Session, dev: &str) -> (StepStatus, String) {
     }
 }
 
-/// Por qué un NTFS no está cerrado limpiamente, o `None` si lo está (o no
-/// se puede saber). Windows hibernado o apagado con el inicio rápido deja
-/// el NTFS a medias: la copia sería fiel, pero de un sistema sin cerrar.
-pub fn ntfs_not_clean(s: &mut Session, dev: &str) -> Option<String> {
-    let out = s
-        .run_unchecked(&Cmd::new("ntfs-3g.probe").arg("--readwrite").arg(dev))
-        .ok()?;
-    match out.code {
-        Some(14) => Some(
+/// Si un NTFS está cerrado limpiamente. Windows hibernado o apagado con el
+/// inicio rápido deja el NTFS a medias: la copia sería fiel, pero de un
+/// sistema sin cerrar.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NtfsState {
+    Clean,
+    /// No está cerrado: por qué y cómo arreglarlo.
+    NotClean(String),
+    /// No se pudo comprobar: por qué. No es lo mismo que limpio.
+    Unknown(String),
+}
+
+/// Comprueba `dev` con `ntfs-3g.probe`, siempre a través de un loop de
+/// solo lectura: el origen no se abre nunca en lectura-escritura, así que
+/// la sonda no puede tocarlo (ni repetir su diario). Solo el código 0 es
+/// «limpio»; cualquier otro resultado, o que falte la herramienta, es
+/// «no se pudo comprobar».
+pub fn ntfs_state(s: &mut Session, dev: &Path) -> NtfsState {
+    const FIX: &str = "Arranca Windows, apágalo del todo (shutdown /s /t 0) y repite la copia";
+    let ro = match s.run(
+        Cmd::new("losetup")
+            .arg("--find")
+            .arg("--show")
+            .arg("--read-only")
+            .arg(dev),
+    ) {
+        Ok(l) => l.trim().to_string(),
+        Err(e) => {
+            return NtfsState::Unknown(format!(
+                "no se pudo comprobar si el NTFS está cerrado (loop de solo lectura: {e:#})"
+            ))
+        }
+    };
+    let out = s.run_unchecked(&Cmd::new("ntfs-3g.probe").arg("--readwrite").arg(&ro));
+    let _ = s.run(Cmd::new("losetup").arg("--detach").arg(&ro));
+    match out.map(|o| o.code) {
+        Ok(Some(0)) => NtfsState::Clean,
+        Ok(Some(14)) => NtfsState::NotClean(format!(
             "Windows está hibernado o se apagó con el inicio rápido: el NTFS no está \
-             cerrado. Arranca Windows, apágalo del todo (shutdown /s /t 0) y repite la copia"
-                .into(),
-        ),
-        Some(15) => Some(
-            "el NTFS no se cerró limpiamente (diario sin vaciar). Arranca Windows, \
-             apágalo del todo (shutdown /s /t 0) y repite la copia"
-                .into(),
-        ),
-        _ => None,
+             cerrado. {FIX}"
+        )),
+        Ok(Some(15)) => NtfsState::NotClean(format!(
+            "el NTFS no se cerró limpiamente (diario sin vaciar). {FIX}"
+        )),
+        Ok(code) => NtfsState::Unknown(format!(
+            "no se pudo comprobar si el NTFS está cerrado (ntfs-3g.probe terminó con {}). \
+             Por si acaso: {FIX}",
+            code.map_or("una señal".to_string(), |c| format!("el código {c}"))
+        )),
+        Err(e) => NtfsState::Unknown(format!(
+            "no se pudo comprobar si el NTFS está cerrado: falta ntfs-3g.probe ({e:#})"
+        )),
     }
 }
 

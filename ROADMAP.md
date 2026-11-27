@@ -27,6 +27,41 @@ everything else in an advanced mode.
 - The space estimate counts the scratch space verification needs, and
   measures the destination even when it isn't mounted.
 
+## v0.2
+
+Scope of 0.1 is frozen. Everything below is planned and not started in
+`master`, unless noted.
+
+1. **Restore from the GUI.** A backup set (`<disk>-<date>.set.json`: disk
+   model and serial, partition table, one report per partition), an engine
+   that writes the table and then each partition (raw as is; Btrfs with
+   `mkfs`, receive and the original UUID), and the screens: pick a backup,
+   pick the disk, confirm by typing the end of its serial number. Drafted in
+   the branch `claude/restaurar-gui`: the engine passes an end-to-end test
+   on loop devices; the screens are untested.
+2. **Used-block images** for NTFS, ext4 and the rest, instead of copying free
+   space.
+3. **LUKS unlocking** from the GUI, so the filesystem inside is backed up and
+   verified.
+4. **Real progress**: percentage by bytes and time left.
+5. **GParted and Xwayland on the ISO**, with root permissions inside cage.
+6. **English interface** (gettext), Spanish kept as a translation.
+7. **External drives mounted read-only at boot**, with existing backups
+   detected.
+8. **Advanced mode extras**: include snapshots, exclusions, sample size,
+   signing keys, live log, re-verify an old backup.
+9. Smaller items noted along the way:
+   - Unclosed NTFS: consider unchecking it by default, not only warning.
+   - Restoring a single raw report from the GUI, and onto a larger disk.
+   - Recreating a restored Btrfs with the original feature flags, and nested
+     subvolumes with their original paths.
+   - The space estimate treats sector-by-sector scratch as full size, though
+     it is written sparse.
+   - vfat and exFAT structure checks are not exercised in CI (the container
+     kernel can't mount them).
+
+The sections below are the design notes for those items.
+
 ## Simple mode
 
 The default: the live USB always starts in simple mode.
