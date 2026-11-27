@@ -966,6 +966,7 @@ dependencies = [
  "gtk4",
  "libadwaita",
  "partshield-core",
+ "serde",
  "serde_json",
  "tempfile",
 ]

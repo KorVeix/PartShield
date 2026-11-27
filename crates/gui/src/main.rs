@@ -7,6 +7,8 @@
 
 mod basic;
 mod model;
+mod restore;
+mod restore_ui;
 
 use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
@@ -49,6 +51,9 @@ fn build_window(app: &adw::Application) {
     // Para pruebas y capturas: abre directamente la copia sencilla.
     if std::env::var_os("PARTSHIELD_GUI_BASIC").is_some() {
         nav.push(&basic::copy_page(app, &nav));
+    }
+    if std::env::var_os("PARTSHIELD_GUI_RESTORE").is_some() {
+        nav.push(&restore_ui::restore_page(app, &nav));
     }
     // Para pruebas y capturas: abre directamente la detección de un dispositivo.
     if let Some(dev) = std::env::var_os("PARTSHIELD_GUI_OPEN") {

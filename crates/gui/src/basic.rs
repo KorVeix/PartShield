@@ -67,9 +67,8 @@ pub fn home_page(app: &adw::Application, nav: &adw::NavigationView) -> adw::Navi
     let restore = action_card(
         "document-revert-symbolic",
         "Restaurar",
-        "Muy pronto. De momento, desde la consola: partshield restore",
+        "Devuelve un disco a como estaba al hacer la copia",
     );
-    restore.set_sensitive(false);
     let cards = gtk::Box::builder()
         .orientation(gtk::Orientation::Horizontal)
         .spacing(18)
@@ -109,6 +108,10 @@ pub fn home_page(app: &adw::Application, nav: &adw::NavigationView) -> adw::Navi
                 nav.push(&copy_page(&app, &nav));
             }
         });
+    }
+    {
+        let (app, nav) = (app.clone(), nav.clone());
+        restore.connect_clicked(move |_| nav.push(&crate::restore_ui::restore_page(&app, &nav)));
     }
     adw::NavigationPage::builder()
         .title("PartShield")
@@ -336,13 +339,16 @@ pub fn copy_page(app: &adw::Application, nav: &adw::NavigationView) -> adw::Navi
             let Some(dest) = f.dest().cloned() else {
                 return;
             };
-            let whole: Vec<PathBuf> = f
-                .picks
-                .iter()
-                .filter(|p| p.whole() && p.disk.volumes.iter().any(|v| v.path != p.disk.path))
-                .map(|p| p.disk.path.clone())
-                .collect();
-            nav.push(&progress_page(&app, &nav, f.items(), whole, dest));
+            // Cada parte, situada en la tabla de su disco, y cada disco:
+            // con eso se escribe el conjunto que luego lista «Restaurar».
+            let mut items = Vec::new();
+            let mut disks = Vec::new();
+            for p in f.picks.iter().filter(|p| p.chosen().next().is_some()) {
+                let partitioned = p.disk.volumes.iter().any(|v| v.path != p.disk.path);
+                disks.push(model::PlanDisk::new(&p.disk, p.whole() && partitioned));
+                items.extend(p.chosen().map(|v| PlanItem::new(v).on_disk(&p.disk.path)));
+            }
+            nav.push(&progress_page(&app, &nav, items, disks, dest));
         });
     }
 
@@ -625,7 +631,7 @@ fn progress_page(
     app: &adw::Application,
     nav: &adw::NavigationView,
     items: Vec<PlanItem>,
-    whole: Vec<PathBuf>,
+    disks: Vec<model::PlanDisk>,
     dest: Destination,
 ) -> adw::NavigationPage {
     let toolbar = adw::ToolbarView::new();
@@ -722,11 +728,14 @@ fn progress_page(
                         let adj = scroll.vadjustment();
                         adj.set_value(adj.upper());
                     }
-                    PlanEvent::Done(i, r) => {
-                        results.borrow_mut()[i] = Some(*r);
-                        finished = i + 1 == n;
-                    }
+                    PlanEvent::Done(i, r) => results.borrow_mut()[i] = Some(*r),
                     PlanEvent::Table(r) => tables.borrow_mut().push(r),
+                    // Un conjunto que no se pudo escribir se enseña con las tablas.
+                    PlanEvent::Set(Ok(_)) => {}
+                    PlanEvent::Set(Err(e)) => tables.borrow_mut().push(Err(format!(
+                        "no se pudo escribir el conjunto de copia: {e}"
+                    ))),
+                    PlanEvent::Finished => finished = true,
                 }
             }
             let i = current.get();
@@ -768,7 +777,7 @@ fn progress_page(
             }
         });
     }
-    gio::spawn_blocking(move || model::run_plan(&items, &whole, &dest, tx));
+    gio::spawn_blocking(move || model::run_plan(&items, &disks, &dest, tx));
     page
 }
 

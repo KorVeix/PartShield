@@ -11,7 +11,9 @@ use partshield_core::detect::superblock::SuperblockCopies;
 use partshield_core::detect::SuperblockExt;
 use partshield_core::detect::{block_stack, read_all_copies};
 use partshield_core::send::multi::SubvolSpec;
-use partshield_core::types::{Assessment, BlockStack, HashAlgo, Mode, Report, Superblock};
+use partshield_core::types::{Assessment, BlockStack, HashAlgo, Mode, Report, Superblock, Verdict};
+
+use crate::restore::{BackupSet, SetDisk, SetPart, SetVerdict};
 use partshield_core::{backup, backup_raw, partclone_version, BackupOptions, RawOptions};
 
 pub fn list_disks() -> Result<(Vec<Disk>, Vec<CommandRecord>)> {
@@ -72,7 +74,7 @@ pub fn detect(device: &Path) -> Result<DetectInfo> {
 // ------------------------------------------------------------------ copia
 
 /// Dónde monta PartShield lo que necesita, fuera de la vista del usuario.
-const RUN_DIR: &str = "/run/partshield";
+pub(crate) const RUN_DIR: &str = "/run/partshield";
 
 /// Un subvolumen de `btrfs subvolume list`.
 #[derive(Debug, Clone, PartialEq)]
@@ -153,7 +155,7 @@ pub fn mount_source(device: &Path, fsid: &str) -> Result<SourceMount> {
     })
 }
 
-fn is_mountpoint(s: &mut Session, path: &Path) -> bool {
+pub(crate) fn is_mountpoint(s: &mut Session, path: &Path) -> bool {
     s.run_unchecked(&Cmd::new("mountpoint").arg("-q").arg(path))
         .map(|o| o.success)
         .unwrap_or(false)
@@ -186,7 +188,8 @@ impl Destination {
 }
 
 /// Sistemas de archivos en los que se puede escribir una copia.
-const DEST_FSTYPES: [&str; 7] = ["btrfs", "ext4", "ext3", "xfs", "exfat", "vfat", "ntfs"];
+pub(crate) const DEST_FSTYPES: [&str; 7] =
+    ["btrfs", "ext4", "ext3", "xfs", "exfat", "vfat", "ntfs"];
 
 /// Volúmenes de otros discos donde guardar la copia: nunca un disco de
 /// origen ni el USB de arranque.
@@ -250,7 +253,7 @@ pub fn prepare_destination(dest: &Destination, s: &mut Session) -> Result<PathBu
             mnt
         }
     };
-    Ok(root.join("partshield-copias"))
+    Ok(root.join(crate::restore::COPIES_DIR))
 }
 
 /// Bytes libres en `path` (o en el primer antecesor que exista).
@@ -463,6 +466,12 @@ pub struct PlanItem {
     pub title: String,
     pub device: PathBuf,
     pub btrfs: bool,
+    pub size: u64,
+    pub fstype: Option<String>,
+    /// Disco al que pertenece y posición en su tabla de particiones; los
+    /// rellena la interfaz para escribir el conjunto de copia.
+    pub disk: Option<PathBuf>,
+    pub index: Option<usize>,
 }
 
 impl PlanItem {
@@ -471,7 +480,18 @@ impl PlanItem {
             title: format!("{} · {}", volume_title(v), devices::human_size(v.size)),
             device: v.path.clone(),
             btrfs: v.is_btrfs(),
+            size: v.size,
+            fstype: v.fstype.clone(),
+            disk: None,
+            index: None,
         }
+    }
+
+    /// La misma parte, situada en la tabla de particiones de `disk`.
+    pub fn on_disk(mut self, disk: &Path) -> Self {
+        self.index = crate::restore::table_index(disk, &self.device);
+        self.disk = Some(disk.to_path_buf());
+        self
     }
 
     /// Lo que puede ocupar la copia, antes de comprimir: lo usado en un
@@ -582,21 +602,57 @@ pub enum PlanEvent {
     Done(usize, Box<PartResult>),
     /// Tabla de particiones guardada (o por qué no).
     Table(Result<PathBuf, String>),
+    /// Conjunto de copia escrito (o por qué no).
+    Set(Result<PathBuf, String>),
+    /// No queda nada por hacer.
+    Finished,
+}
+
+/// Un disco del que se copia algo, para su conjunto de copia.
+#[derive(Debug, Clone)]
+pub struct PlanDisk {
+    pub path: PathBuf,
+    pub model: Option<String>,
+    pub serial: Option<String>,
+    pub size: u64,
+    /// Se copia entero: se guarda también su tabla de particiones.
+    pub whole: bool,
+}
+
+impl PlanDisk {
+    pub fn new(d: &Disk, whole: bool) -> Self {
+        Self {
+            path: d.path.clone(),
+            model: d.model.clone(),
+            serial: d.serial.clone(),
+            size: d.size,
+            whole,
+        }
+    }
 }
 
 /// Copia y verifica cada parte, una detrás de otra. Un fallo en una no
-/// para las demás: cada una tiene su propio veredicto. Si se copia el disco
-/// entero, guarda antes su tabla de particiones (`sfdisk --dump`).
+/// para las demás: cada una tiene su propio veredicto. De un disco entero
+/// guarda antes su tabla de particiones (`sfdisk --dump`). Al final escribe
+/// un conjunto de copia por disco: lo que lista «Restaurar».
 pub fn run_plan(
     items: &[PlanItem],
-    whole_disks: &[PathBuf],
+    disks: &[PlanDisk],
     dest: &Destination,
     events: Sender<PlanEvent>,
 ) {
-    for disk in whole_disks {
-        let r = save_partition_table(disk, dest).map_err(|e| format!("{e:#}"));
-        let _ = events.send(PlanEvent::Table(r));
+    let stamp = chrono::Local::now();
+    let mut tables: Vec<Option<PathBuf>> = Vec::new();
+    for disk in disks {
+        if !disk.whole {
+            tables.push(None);
+            continue;
+        }
+        let r = save_partition_table(&disk.path, dest);
+        tables.push(r.as_ref().ok().cloned());
+        let _ = events.send(PlanEvent::Table(r.map_err(|e| format!("{e:#}"))));
     }
+    let mut parts: Vec<Option<SetPart>> = Vec::new();
     for (i, item) in items.iter().enumerate() {
         let _ = events.send(PlanEvent::Part(i));
         let (tx, rx) = std::sync::mpsc::channel::<String>();
@@ -608,16 +664,90 @@ pub fn run_plan(
                 }
             })
         };
-        let r = run_item(item, dest, tx).map_err(|e| format!("{e:#}"));
+        let mut default_subvolume = None;
+        let r = run_item(item, dest, tx, &mut default_subvolume).map_err(|e| format!("{e:#}"));
         let _ = fwd.join();
+        parts.push(Some(set_part(item, &r, default_subvolume)));
         let _ = events.send(PlanEvent::Done(i, Box::new(r)));
     }
+    for (disk, table) in disks.iter().zip(tables) {
+        let mine: Vec<SetPart> = items
+            .iter()
+            .zip(parts.iter_mut())
+            .filter(|(it, _)| it.disk.as_deref() == Some(disk.path.as_path()))
+            .filter_map(|(_, p)| p.take())
+            .collect();
+        if mine.is_empty() {
+            continue;
+        }
+        let set = BackupSet {
+            version: 1,
+            created: stamp.to_rfc3339(),
+            disk: SetDisk {
+                path: disk.path.display().to_string(),
+                model: disk.model.clone(),
+                serial: disk.serial.clone(),
+                size: disk.size,
+            },
+            table: table.and_then(|t| t.file_name().map(|n| n.to_string_lossy().into_owned())),
+            parts: mine,
+        };
+        let r = save_set(&set, &disk.path, dest, &stamp).map_err(|e| format!("{e:#}"));
+        let _ = events.send(PlanEvent::Set(r));
+    }
+    let _ = events.send(PlanEvent::Finished);
+}
+
+fn set_part(item: &PlanItem, r: &PartResult, default_subvolume: Option<String>) -> SetPart {
+    let (report, verdict, error) = match r {
+        Ok((rep, path)) => (
+            path.file_name().map(|n| n.to_string_lossy().into_owned()),
+            match (&rep.error, rep.verdict()) {
+                (Some(_), _) | (_, Verdict::Invalid) => SetVerdict::Invalid,
+                (_, Verdict::Reduced) => SetVerdict::Reduced,
+                (_, Verdict::Valid) => SetVerdict::Valid,
+            },
+            rep.error.clone(),
+        ),
+        Err(e) => (None, SetVerdict::Invalid, Some(e.clone())),
+    };
+    SetPart {
+        index: item.index,
+        device: item.device.display().to_string(),
+        title: item.title.clone(),
+        size: item.size,
+        fstype: item.fstype.clone(),
+        report,
+        verdict,
+        error,
+        default_subvolume,
+    }
+}
+
+fn save_set(
+    set: &BackupSet,
+    disk: &Path,
+    dest: &Destination,
+    stamp: &chrono::DateTime<chrono::Local>,
+) -> Result<PathBuf> {
+    let mut s = Session::new(false);
+    let dir = prepare_destination(dest, &mut s)?;
+    let name = disk
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "disco".into());
+    set.save(&dir, &format!("{name}-{}", stamp.format("%Y%m%d-%H%M%S")))
 }
 
 /// Btrfs por `btrfs send` (solo datos, todos los subvolúmenes que no son
 /// snapshots) si es seguro; si no, y para todo lo demás, imagen sector a
 /// sector, que vale para cualquier contenido y se compara bit a bit.
-fn run_item(item: &PlanItem, dest: &Destination, tx: Sender<String>) -> Result<(Report, PathBuf)> {
+fn run_item(
+    item: &PlanItem,
+    dest: &Destination,
+    tx: Sender<String>,
+    default_subvolume: &mut Option<String>,
+) -> Result<(Report, PathBuf)> {
     let opts = JobOptions {
         dest: dest.clone(),
         zstd_level: 3,
@@ -638,6 +768,7 @@ fn run_item(item: &PlanItem, dest: &Destination, tx: Sender<String>) -> Result<(
         bail!("ningún modo de copia es seguro para este Btrfs; míralo en el modo avanzado");
     }
     let m = mount_source(&item.device, &info.superblock.fsid)?;
+    *default_subvolume = default_subvolume_of(&m.mountpoint);
     let mut subvolumes: Vec<String> = m
         .subvolumes
         .iter()
@@ -656,6 +787,25 @@ fn run_item(item: &PlanItem, dest: &Destination, tx: Sender<String>) -> Result<(
     let r = run_job(&job, &opts, tx);
     let _ = Session::new(false).run_unchecked(&Cmd::new("umount").arg(&m.mountpoint));
     r
+}
+
+/// Ruta del subvolumen por defecto de un Btrfs montado, o `None` si es el
+/// nivel superior: `ID 256 gen 7 top level 5 path @` → `@`.
+fn default_subvolume_of(mount: &Path) -> Option<String> {
+    let out = Session::new(false)
+        .run(
+            Cmd::new("btrfs")
+                .arg("subvolume")
+                .arg("get-default")
+                .arg(mount),
+        )
+        .ok()?;
+    parse_default_subvolume(&out)
+}
+
+fn parse_default_subvolume(out: &str) -> Option<String> {
+    let (_, path) = out.trim().split_once(" path ")?;
+    Some(path.trim().to_string())
 }
 
 fn save_partition_table(disk: &Path, dest: &Destination) -> Result<PathBuf> {
@@ -877,23 +1027,28 @@ mod tests {
         );
     }
 
-    /// Modo sencillo con loops: disco con tabla GPT, una ext4 (imagen sector
-    /// a sector) y un Btrfs (send) → ext4. Necesita root y
+    /// Modo sencillo con loops, de punta a punta: copiar un disco con tabla
+    /// GPT, una ext4 (sector a sector) y un Btrfs con @ y @home (send), y
+    /// restaurar el conjunto en otro disco. Necesita root y
     /// PARTSHIELD_GUI_E2E=1.
     #[test]
-    fn whole_disk_plan_end_to_end_on_loops() {
+    fn whole_disk_backup_and_restore_on_loops() {
+        use crate::restore::{run_restore, BackupSet, RestoreEvent};
         if !nix_root() || std::env::var_os("PARTSHIELD_GUI_E2E").is_none() {
             eprintln!("omitida: PARTSHIELD_GUI_E2E=1 y root");
             return;
         }
         std::env::set_var("PARTSHIELD_SANDBOX", "1");
         let dir = tempfile::tempdir().unwrap();
-        let sh = |c: &str| {
-            let o = std::process::Command::new("sh")
+        let try_sh = |c: &str| {
+            std::process::Command::new("sh")
                 .arg("-c")
                 .arg(c)
                 .output()
-                .unwrap();
+                .unwrap()
+        };
+        let sh = |c: &str| {
+            let o = try_sh(c);
             assert!(
                 o.status.success(),
                 "{c}: {}",
@@ -902,40 +1057,38 @@ mod tests {
             String::from_utf8(o.stdout).unwrap().trim().to_string()
         };
         let d = dir.path().display();
-        let src = sh(&format!(
-            "truncate -s 600M {d}/src.img && \
-             printf 'label: gpt\\n,64M\\n,\\n' | sfdisk -q {d}/src.img && \
-             losetup -f -P --show {d}/src.img"
+        sh(&format!(
+            "truncate -s 600M {d}/src.img {d}/new.img && truncate -s 2G {d}/dst.img && \
+             printf 'label: gpt\\n,64M\\n,\\n' | sfdisk -q {d}/src.img"
         ));
-        let dst = sh(&format!(
-            "truncate -s 2G {d}/dst.img && losetup -f --show {d}/dst.img"
-        ));
-        // Si el kernel no crea /dev/loopNpM (sin udev ni tablas GPT, como
-        // en algunas VM), cada partición va a su propio loop con --offset.
-        let part = |n: usize| -> String {
-            let node = format!("{src}p{n}");
-            if Path::new(&node).exists() {
-                return node;
-            }
-            let (start, size) = {
-                let j = sh(&format!("sfdisk -J {d}/src.img"));
-                let v: serde_json::Value = serde_json::from_str(&j).unwrap();
-                let p = &v["partitiontable"]["partitions"][n - 1];
-                (p["start"].as_u64().unwrap(), p["size"].as_u64().unwrap())
-            };
+        // Sin udev ni partscan (contenedores), cada partición va a su propio
+        // loop con --offset; vale igual para el disco nuevo, que aún no
+        // tiene tabla.
+        let table: serde_json::Value =
+            serde_json::from_str(&sh(&format!("sfdisk -J {d}/src.img"))).unwrap();
+        let part = |img: &str, n: usize| -> String {
+            let p = &table["partitiontable"]["partitions"][n];
             sh(&format!(
-                "losetup -f --show --offset {} --sizelimit {} {d}/src.img",
-                start * 512,
-                size * 512
+                "losetup -f --show --offset {} --sizelimit {} {d}/{img}",
+                p["start"].as_u64().unwrap() * 512,
+                p["size"].as_u64().unwrap() * 512
             ))
         };
-        let (p1, p2) = (part(1), part(2));
+        let src = sh(&format!("losetup -f --show {d}/src.img"));
+        let dst = sh(&format!("losetup -f --show {d}/dst.img"));
+        let (p1, p2) = (part("src.img", 0), part("src.img", 1));
         sh(&format!(
             "mkfs.ext4 -q -L arranque {p1} && mkfs.btrfs -q -L linux {p2} && \
              mkfs.ext4 -q -L copias {dst} && \
-             m=$(mktemp -d) && mount {p2} $m && btrfs -q subvolume create $m/@ && \
-             head -c 2M /dev/urandom > $m/@/datos.bin && umount $m"
+             m=$(mktemp -d) && mount {p2} $m && btrfs -q subvolume create $m/@ $m/@home && \
+             mkdir -p $m/@home/ana && echo hola > $m/@home/ana/nota.txt && \
+             head -c 2M /dev/urandom > $m/@/datos.bin && cp $m/@/datos.bin {d}/datos.bin && \
+             umount $m"
         ));
+        let uuid = sh(&format!("blkid -s UUID -o value {p2}"));
+        let p1_hash = sh(&format!("sha256sum < {p1}"));
+
+        // ---- copia
         let vol = |path: &str, fstype: &str, size: u64| Volume {
             path: PathBuf::from(path),
             kind: "part".into(),
@@ -947,10 +1100,23 @@ mod tests {
             parttype: None,
             mountpoints: vec![],
         };
+        let located = |v: Volume, index: usize| {
+            let mut it = PlanItem::new(&v);
+            it.disk = Some(PathBuf::from(&src));
+            it.index = Some(index);
+            it
+        };
         let items = [
-            PlanItem::new(&vol(&p1, "ext4", 64 << 20)),
-            PlanItem::new(&vol(&p2, "btrfs", 535 << 20)),
+            located(vol(&p1, "ext4", 64 << 20), 0),
+            located(vol(&p2, "btrfs", 535 << 20), 1),
         ];
+        let disks = [PlanDisk {
+            path: PathBuf::from(&src),
+            model: Some("Disco de pruebas".into()),
+            serial: Some("SERIE1234".into()),
+            size: 600 << 20,
+            whole: true,
+        }];
         let dest = Destination {
             device: PathBuf::from(&dst),
             disk: "loop".into(),
@@ -960,50 +1126,139 @@ mod tests {
             mountpoint: None,
         };
         let (tx, rx) = std::sync::mpsc::channel();
-        run_plan(&items, &[PathBuf::from(&src)], &dest, tx);
+        run_plan(&items, &disks, &dest, tx);
         let mut done = Vec::new();
-        let mut table = None;
-        let mut commands = 0;
+        let mut set_path = None;
+        let mut finished = false;
         for ev in rx.try_iter() {
             match ev {
                 PlanEvent::Done(i, r) => done.push((i, *r)),
-                PlanEvent::Table(t) => table = Some(t),
-                PlanEvent::Command(_) => commands += 1,
-                PlanEvent::Part(_) => {}
+                PlanEvent::Set(r) => set_path = Some(r.unwrap()),
+                PlanEvent::Finished => finished = true,
+                _ => {}
             }
         }
         let dmnt = format!(
             "/run/partshield/destino/{}",
             Path::new(&dst).file_name().unwrap().to_string_lossy()
         );
-        let table_text = table
-            .as_ref()
-            .and_then(|t| t.as_ref().ok())
-            .map(|p| std::fs::read_to_string(p).unwrap_or_default());
-        let _ = std::process::Command::new("umount").arg(&dmnt).status();
-        let _ = sh(&format!("losetup -d {src} {dst}"));
-        for p in [&p1, &p2] {
-            if !p.starts_with(&src) {
-                let _ = sh(&format!("losetup -d {p}"));
+        let cleanup = |extra: &[&str]| {
+            let _ = try_sh(&format!("umount {dmnt}"));
+            let _ = try_sh(&format!(
+                "losetup -d {src} {dst} {p1} {p2} {}",
+                extra.join(" ")
+            ));
+        };
+        if done.len() != 2 || !finished || set_path.is_none() {
+            cleanup(&[]);
+            panic!("la copia no terminó: {} partes", done.len());
+        }
+        for (i, r) in &done {
+            let ok = r
+                .as_ref()
+                .is_ok_and(|(rep, _)| rep.error.is_none() && rep.verdict() == Verdict::Valid);
+            if !ok {
+                cleanup(&[]);
+                panic!(
+                    "parte {i}: {:?}",
+                    r.as_ref().map(|(rep, _)| rep.verification.clone())
+                );
             }
         }
-        assert!(table_text.unwrap().contains("label: gpt"));
-        assert!(commands > 0);
-        assert_eq!(done.len(), 2);
-        for (i, r) in &done {
-            let (report, _) = r.as_ref().unwrap_or_else(|e| panic!("parte {i}: {e}"));
-            assert_eq!(report.error, None, "parte {i}");
-            // ext4 pasa por e2fsck y Btrfs por btrfs check: las dos válidas.
-            assert_eq!(
-                report.verdict(),
-                partshield_core::types::Verdict::Valid,
-                "parte {i}: {:#?}",
-                report.verification
+        let set_path = set_path.unwrap();
+        let set = BackupSet::load(&set_path).unwrap();
+        assert_eq!(set.verdict(), SetVerdict::Valid);
+        assert_eq!(set.not_restorable(), None);
+        assert_eq!(set.disk.serial.as_deref(), Some("SERIE1234"));
+        assert_eq!(set.parts.len(), 2);
+        assert_eq!(set.parts[1].default_subvolume, None);
+
+        // ---- restauración en un disco nuevo. El original se desconecta:
+        // dos Btrfs con el mismo UUID a la vez no pueden convivir.
+        let _ = try_sh(&format!("losetup -d {src} {p1} {p2}"));
+        let new = sh(&format!("losetup -f --show {d}/new.img"));
+        let (n1, n2) = (part("new.img", 0), part("new.img", 1));
+        let restore = |set_path: &Path| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            run_restore(
+                set_path,
+                Path::new(&new),
+                Some(vec![PathBuf::from(&n1), PathBuf::from(&n2)]),
+                tx,
             );
-        }
+            rx.try_iter()
+                .find_map(|e| match e {
+                    RestoreEvent::Finished(r) => Some(r),
+                    _ => None,
+                })
+                .expect("sin evento final")
+        };
+
+        // Un archivo de la copia dañado: no se escribe nada en el disco.
+        let stream = sh(&format!("ls {dmnt}/partshield-copias/*.raw.zst"));
+        sh(&format!(
+            "cp {stream} {d}/bueno.zst && printf 'X' | dd of={stream} bs=1 seek=100 conv=notrunc status=none"
+        ));
+        let bad = restore(&set_path);
+        let untouched = try_sh(&format!("sfdisk -J {new}"));
+        sh(&format!("cp {d}/bueno.zst {stream}"));
+        let good = restore(&set_path);
+
+        let checks = (|| -> Result<(), String> {
+            let e = bad.as_ref().err().ok_or("la copia dañada se restauró")?;
+            if !e.contains("no se ha escrito nada") {
+                return Err(format!("mensaje inesperado: {e}"));
+            }
+            if untouched.status.success() {
+                return Err("el disco tenía tabla tras la restauración fallida".into());
+            }
+            good.as_ref().map_err(|e| format!("restaurar falló: {e}"))?;
+            let parts = |img: &str| -> Vec<(u64, u64, String, String)> {
+                let v: serde_json::Value =
+                    serde_json::from_str(&sh(&format!("sfdisk -J {d}/{img}"))).unwrap();
+                v["partitiontable"]["partitions"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|p| {
+                        (
+                            p["start"].as_u64().unwrap(),
+                            p["size"].as_u64().unwrap(),
+                            p["type"].as_str().unwrap().to_string(),
+                            p["uuid"].as_str().unwrap().to_string(),
+                        )
+                    })
+                    .collect()
+            };
+            if parts("src.img") != parts("new.img") {
+                return Err("la tabla restaurada no es igual".into());
+            }
+            if sh(&format!("sha256sum < {n1}")) != p1_hash {
+                return Err("la ext4 restaurada no es idéntica".into());
+            }
+            if sh(&format!("blkid -s UUID -o value {n2}")) != uuid {
+                return Err("el Btrfs restaurado no tiene el UUID original".into());
+            }
+            let out = sh(&format!(
+                "m=$(mktemp -d) && mount -o ro {n2} $m && \
+                 cmp $m/@/datos.bin {d}/datos.bin && cat $m/@home/ana/nota.txt && \
+                 btrfs subvolume list $m | awk '{{print $NF}}' | sort | tr '\\n' ' '; umount $m"
+            ));
+            if out != "hola\n@ @home" {
+                return Err(format!("contenido del Btrfs restaurado: {out:?}"));
+            }
+            Ok(())
+        })();
+        cleanup(&[&new, &n1, &n2]);
+        checks.unwrap();
+    }
+
+    #[test]
+    fn default_subvolume_is_none_for_the_top_level() {
+        assert_eq!(parse_default_subvolume("ID 5 (FS_TREE)\n"), None);
         assert_eq!(
-            done[1].1.as_ref().unwrap().0.mode,
-            partshield_core::types::Mode::Send
+            parse_default_subvolume("ID 256 gen 7 top level 5 path @\n").as_deref(),
+            Some("@")
         );
     }
 
