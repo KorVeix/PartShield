@@ -16,11 +16,13 @@ para el código y los tests automáticos.
 
 ## Lo que ya se sabe antes de empezar
 
-- No hay detección de NTFS sucio (Windows hibernado o con Fast Startup) ni
-  de BitLocker. C3 y C4 comprueban qué pasa hoy.
-- Un disco entero en raw es **un solo archivo** (`.zst`), pero la
-  verificación omite estructura y montaje porque no entra en las
-  particiones de la imagen: sale 🟡 como mucho. C11 lo comprueba.
+- NTFS sin cerrar (Windows hibernado o con Fast Startup) y BitLocker se
+  detectan: la interfaz avisa antes de copiar y la copia sale 🟡 con el
+  motivo, nunca 🟢. Probado con loops (un `hiberfil.sys` con la marca
+  «hibr»); C3 y C4 lo confirman con un Windows de verdad.
+- Un disco entero en raw es **un solo archivo** (`.zst`). La verificación
+  entra en cada partición de la imagen (fsck y montaje): puede salir 🟢. Si
+  hay una partición cifrada o un NTFS sin cerrar, sale 🟡. C11 lo comprueba.
 - Restaurar un disco entero copiado por particiones no es una sola acción:
   tabla y ESP con `restore-layout`, NTFS en raw y Btrfs con `mkfs.btrfs`,
   `restore` y UUID. La restauración desde la GUI está pendiente.
@@ -42,15 +44,15 @@ para el código y los tests automáticos.
 | --- | --- | --- | --- |
 | C1 | ESP FAT32 en raw | 🟢 | fsck, montaje e idéntica bit a bit |
 | C2 | NTFS con Windows apagado del todo (Fast Startup desactivado) | 🟢 | Ídem |
-| C3 | NTFS con Fast Startup activado | 🟡 / 🔴 | Nunca 🟢 sin aviso. Si da 🟢, fallo confirmado |
-| C4 | NTFS con BitLocker (si está activo) | 🟡 / 🔴 | Ídem |
+| C3 | NTFS con Fast Startup activado | 🟡 | Aviso antes de copiar y «estructura» omitida con el motivo. Si da 🟢, fallo |
+| C4 | NTFS con BitLocker (si está activo) | 🟡 | Sale como «Windows cifrado (BitLocker)», con aviso; idéntica bit a bit |
 | C5 | Btrfs de CachyOS, todos los subvolúmenes | 🟢 | Pasan los cinco pasos |
 | C6 | Disco entero desde la GUI (tabla + particiones) | 🟢 | Informe con el `.sfdisk` y cada partición |
 | C7 | Btrfs incremental (`--parent`) tras cambiar archivos | 🟢 | La cadena se verifica |
 | C8 | Corromper 1 byte de un stream y ejecutar `verify` | 🔴 | Lo detecta |
 | C9 | Desenchufar el destino a mitad de copia | 🔴 | No queda un informe «válido» a medias |
 | C10 | Restaurar por particiones (C6) sobre el SSD borrado | Arrancan los dos | Windows y CachyOS arrancan, están los testigos y no se pide la clave de BitLocker |
-| C11 | Disco entero en un solo archivo (raw) | 🟡 hoy | Imagen idéntica bit a bit; anotar qué pasos se omiten |
+| C11 | Disco entero en un solo archivo (raw) | 🟢 (🟡 con BitLocker) | Idéntica bit a bit, y fsck y montaje de cada partición |
 | C12 | Restaurar C11 sobre el SSD borrado | Arrancan los dos | Igual que C10 |
 
 Orden: P1–P3, C1, C2, C5, C11, C6, C7, C8, C9 y al final C12 y C10, que
@@ -82,13 +84,6 @@ sudo partshield backup --mode raw /dev/nvme0n1 --dest /mnt/usb/t480
 # C12: devolverlo al SSD
 sudo partshield restore --report /mnt/usb/t480/XXXX.report.json --to /dev/nvme0n1
 ```
-
-## Mejora detectada
-
-Para que C11 pueda salir 🟢: al verificar una imagen de disco entero,
-enlazar el loop con `--partscan` y pasar estructura y montaje a cada
-partición de dentro. Con eso, «un archivo, un disco» es la forma más simple
-de copia y restauración, y la base del botón «Restaurar» de la GUI.
 
 ## Resultados
 

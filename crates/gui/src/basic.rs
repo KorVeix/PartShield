@@ -228,6 +228,8 @@ struct Form {
     dests: Vec<(Destination, gtk::CheckButton)>,
     dest_rows: Vec<adw::ActionRow>,
     radio_anchor: Option<gtk::CheckButton>,
+    /// Libre medido de cada destino (`None`: no se pudo medir).
+    free: std::collections::HashMap<PathBuf, Option<u64>>,
 }
 
 impl Form {
@@ -466,7 +468,11 @@ fn sync_disk_check(check: &gtk::CheckButton, parts: &[(Volume, gtk::CheckButton)
 }
 
 fn part_hint(v: &Volume) -> String {
+    if let Some(w) = model::volume_warning(v) {
+        return format!("⚠ {w}");
+    }
     let mut s = match v.fstype.as_deref() {
+        _ if v.is_msr() => "No hace falta copiarla: no guarda datos".to_string(),
         Some("btrfs") => "Se copian los datos y se comprueba la copia restaurándola".to_string(),
         Some("crypto_LUKS") => "Se copia cifrada y entera, sector a sector".to_string(),
         Some("swap") => "No hace falta copiarla: el sistema la vuelve a crear".to_string(),
@@ -514,10 +520,9 @@ fn refresh_form(
             let radio = gtk::CheckButton::new();
             radio.set_valign(gtk::Align::Center);
             radio.set_group(Some(&anchor));
-            let free = d
-                .mountpoint
-                .as_deref()
-                .and_then(model::free_bytes)
+            let measured = model::measure_free(&d);
+            f.free.insert(d.device.clone(), measured);
+            let free = measured
                 .map(|b| format!(" · {} libres", human_size(b)))
                 .unwrap_or_default();
             let row = plain_row(
@@ -566,16 +571,16 @@ fn refresh_form(
     }
 
     let items = f.items();
-    let sizes: u64 = f
+    let parts: Vec<u64> = f
         .picks
         .iter()
         .flat_map(|p| p.chosen())
         .map(|v| PlanItem::new(v).max_bytes(v.size))
-        .sum();
+        .collect();
+    let need = model::SpaceNeed::of(&parts);
     let free = f
         .dest()
-        .and_then(|d| d.mountpoint.as_deref())
-        .and_then(model::free_bytes);
+        .and_then(|d| f.free.get(&d.device).copied().flatten());
     let (title, text, ok) = if items.is_empty() {
         ("Marca algo que copiar".to_string(), String::new(), false)
     } else if f.dest().is_none() {
@@ -583,18 +588,29 @@ fn refresh_form(
     } else {
         let n = items.len();
         let title = format!(
-            "{n} {} · hasta {} antes de comprimir",
+            "{n} {} · hasta {} de copia y {} temporales para comprobarla",
             if n == 1 { "parte" } else { "partes" },
-            human_size(sizes)
+            human_size(need.copies),
+            human_size(need.scratch)
         );
-        let text = match free {
-            Some(b) if b < sizes => format!(
-                "Puede que no quepa: el destino tiene {} libres. Comprimida suele ocupar \
-                 bastante menos, pero no está garantizado.",
-                human_size(b)
+        let have = free.map(human_size).unwrap_or_default();
+        let text = match need.fit(free) {
+            model::Fit::Fits => format!("Cabe: el destino tiene {have} libres."),
+            model::Fit::Tight => format!(
+                "Va justo: sin comprimir harían falta hasta {} y el destino tiene {have} \
+                 libres. Comprimida suele ocupar menos, pero puede no caber. Para ir sobre \
+                 seguro, copia menos partes cada vez.",
+                human_size(need.total())
             ),
-            Some(b) => format!("Cabe: el destino tiene {} libres.", human_size(b)),
-            None => "El espacio libre del destino se comprueba al empezar.".into(),
+            model::Fit::No => format!(
+                "⚠ No cabe: solo comprobar la parte más grande necesita {} temporales y el \
+                 destino tiene {have} libres. Usa un disco con más espacio.",
+                human_size(need.scratch)
+            ),
+            model::Fit::Unknown => {
+                "No se ha podido medir el espacio libre del destino; se comprueba al empezar."
+                    .into()
+            }
         };
         (title, text, true)
     };

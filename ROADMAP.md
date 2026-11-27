@@ -5,7 +5,7 @@ everything else in an advanced mode.
 
 ## Before calling it 1.0
 
-1. ~~Own repository with CI, README and license.~~ Done: `bytebein/PartShield`,
+1. ~~Own repository with CI, README and license.~~ Done: `KorVeix/PartShield`,
    GPL-3.0.
 2. A real backup of an everyday disk (Btrfs, ~653 GiB), restored and verified
    end to end on real hardware.
@@ -20,6 +20,12 @@ everything else in an advanced mode.
   via send, everything else sector by sector.
 - "Structure" step for ext2/3/4, vfat, exFAT, XFS and NTFS using their
   read-only fsck, so backups of those partitions can come out valid.
+- Unclean NTFS (Windows hibernated or shut down with Fast Startup) and
+  BitLocker are detected: a warning before copying, and the backup is never
+  green.
+- A whole-disk raw image is verified partition by partition (fsck and mount).
+- The space estimate counts the scratch space verification needs, and
+  measures the destination even when it isn't mounted.
 
 ## Simple mode
 
@@ -96,8 +102,6 @@ it first with GParted.
   - NTFS, EFI and the rest as an image of used blocks only (today the whole
     partition is copied, free space included).
   - Each partition is verified by restoring it.
-- **Dirty NTFS** (Windows hibernated or with Fast Startup): warn and don't
-  copy.
 - **Progress bar** with a real percentage. Today it advances per part (copy
   and verification); on a large sector-by-sector image it sits still until
   the copy finishes.

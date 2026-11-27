@@ -222,7 +222,9 @@ fn raw_image_backup_verify_restore() {
         "losetup",
         &["--list", "--noheadings", "--output", "BACK-FILE"],
     );
-    assert!(!loops.contains("partshield-raw-verify"), "{loops}");
+    // Solo las de este test: otros tests verifican a la vez.
+    let mine = format!("{}/partshield-raw-verify", tmp.path().display());
+    assert!(!loops.contains(&mine), "{loops}");
 }
 
 /// Los sistemas de archivos de un disco entero (EFI, Windows, Linux…) pasan
@@ -293,4 +295,137 @@ fn raw_image_checks_structure_of_other_filesystems() {
         );
         assert_eq!(report.verdict(), Verdict::Valid, "{mkfs}: {:#?}", v.steps);
     }
+}
+
+/// Windows hibernado o apagado con el inicio rápido deja `hiberfil.sys` con
+/// la marca «hibr». La copia es fiel, pero nunca sale válida: «estructura»
+/// se omite y explica cómo cerrarlo.
+#[test]
+fn raw_image_of_hibernated_ntfs_is_never_valid() {
+    if std::env::var_os("PARTSHIELD_E2E").is_none() {
+        eprintln!("omitido: define PARTSHIELD_E2E=1 (necesita root y loop devices)");
+        return;
+    }
+    let have = |p: &str| {
+        Command::new("sh")
+            .arg("-c")
+            .arg(format!("command -v {p}"))
+            .output()
+            .is_ok_and(|o| o.status.success())
+    };
+    if !have("mkfs.ntfs") || !have("ntfs-3g.probe") {
+        eprintln!("omitido: falta ntfs-3g");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let origin = Loop::new(tmp.path(), "origen", 200 << 20);
+    sh("mkfs.ntfs", &["-Q", "-q", "-F", &origin.dev]);
+    sh(
+        "mount",
+        &["-t", "ntfs-3g", &origin.dev, origin.mnt.to_str().unwrap()],
+    );
+    let mut hiber = b"hibr".to_vec();
+    hiber.resize(8192, 0);
+    fs::write(origin.mnt.join("hiberfil.sys"), hiber).unwrap();
+    origin.umount();
+
+    let dest = tmp.path().join("copias");
+    let (report, _) = backup_raw(
+        &mut Session::new(false),
+        &RawOptions {
+            device: Path::new(&origin.dev),
+            dest_dir: &dest,
+            scratch_dir: Some(tmp.path()),
+            zstd_level: 3,
+            hash: HashAlgo::Blake3,
+            sign_key: None,
+        },
+    )
+    .unwrap();
+    let v = report.verification.as_ref().unwrap();
+    assert_eq!(report.verdict(), Verdict::Reduced, "{:#?}", v.steps);
+    let st = v.steps.iter().find(|s| s.name == "estructura").unwrap();
+    assert_eq!(st.status, StepStatus::Skipped);
+    assert!(st.detail.contains("shutdown /s /t 0"), "{}", st.detail);
+    assert_eq!(step(v, "comparacion"), StepStatus::Passed);
+}
+
+/// Disco entero en un solo archivo: la verificación entra en cada partición
+/// (fsck y montaje) y la copia sale válida. La partición sin formato no
+/// cuenta.
+#[test]
+fn raw_image_of_whole_disk_checks_each_partition() {
+    if std::env::var_os("PARTSHIELD_E2E").is_none() {
+        eprintln!("omitido: define PARTSHIELD_E2E=1 (necesita root y loop devices)");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let img = tmp.path().join("disco.img");
+    fs::File::create(&img).unwrap().set_len(700 << 20).unwrap();
+    let script = "label: gpt\n,64M\n,16M\n,\n";
+    let mut child = Command::new("sfdisk")
+        .arg("-q")
+        .arg(&img)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::io::Write;
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+
+    // Formatea cada partición por su desplazamiento (sin depender de partscan).
+    let table: serde_json::Value =
+        serde_json::from_str(&sh("sfdisk", &["--json", img.to_str().unwrap()])).unwrap();
+    let parts = table["partitiontable"]["partitions"].as_array().unwrap();
+    let part_loop = |i: usize| {
+        let (start, size) = (
+            parts[i]["start"].as_u64().unwrap() * 512,
+            parts[i]["size"].as_u64().unwrap() * 512,
+        );
+        sh(
+            "losetup",
+            &[
+                "--find",
+                "--show",
+                "--offset",
+                &start.to_string(),
+                "--sizelimit",
+                &size.to_string(),
+                img.to_str().unwrap(),
+            ],
+        )
+    };
+    let p1 = part_loop(0);
+    sh("mkfs.ext4", &["-q", &p1]);
+    sh("losetup", &["--detach", &p1]);
+    let p3 = part_loop(2);
+    sh("mkfs.btrfs", &["-q", &p3]);
+    sh("losetup", &["--detach", &p3]);
+
+    let disk = sh("losetup", &["--find", "--show", img.to_str().unwrap()]);
+    let dest = tmp.path().join("copias");
+    let result = backup_raw(
+        &mut Session::new(false),
+        &RawOptions {
+            device: Path::new(&disk),
+            dest_dir: &dest,
+            scratch_dir: Some(tmp.path()),
+            zstd_level: 3,
+            hash: HashAlgo::Blake3,
+            sign_key: None,
+        },
+    );
+    sh("losetup", &["--detach", &disk]);
+    let (report, _) = result.unwrap();
+    let v = report.verification.as_ref().unwrap();
+    assert_eq!(report.verdict(), Verdict::Valid, "{:#?}", v.steps);
+    let st = v.steps.iter().find(|s| s.name == "estructura").unwrap();
+    assert!(st.detail.contains("partición 1"), "{}", st.detail);
+    assert!(st.detail.contains("partición 3"), "{}", st.detail);
+    assert!(!st.detail.contains("partición 2"), "{}", st.detail);
 }

@@ -14,7 +14,7 @@
   <img src="https://img.shields.io/badge/Debian_13-live_USB-1f7a57?logo=debian&logoColor=white" alt="Debian 13">
   <img src="https://img.shields.io/badge/Secure_Boot-s%C3%AD-1f7a57" alt="Secure Boot">
   <a href="LICENSE"><img src="https://img.shields.io/badge/licencia-GPL--3.0-1f7a57" alt="GPL-3.0"></a>
-  <a href="https://github.com/bytebein/PartShield/actions/workflows/ci.yml"><img src="https://github.com/bytebein/PartShield/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/KorVeix/PartShield/actions/workflows/ci.yml"><img src="https://github.com/KorVeix/PartShield/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <img src="https://img.shields.io/badge/estado-en_desarrollo-9a5b00" alt="En desarrollo">
 </p>
 
